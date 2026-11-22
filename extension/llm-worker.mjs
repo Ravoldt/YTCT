@@ -1,23 +1,59 @@
 // Connection flow and provider metadata adapted from Cline (Apache-2.0).
-// See LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
+// See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
 import {
-  activeProfile, chatEndpoint, defaultLlmConfig, maskKey, modelsEndpoint, normalizeLlmConfig,
-  normalizeProfile, originPattern, providerHeaders, providerKeyRequired, providerOrigin,
+  activeProfile, canonicalEndpoint, chatEndpoint, maskKey, modelsEndpoint, normalizeLlmConfig,
+  normalizeProfile, originPattern, profileDestination, providerHeaders, providerKeyRequired, providerOrigin,
   providerSpecFor, reasoningEffort,
 } from './llm-config.mjs';
+import { relayOffscreen } from './offscreen-worker.mjs';
 
 const CONFIG_KEY = 'llmConfig';
 const KEYS_KEY = 'llmKeys';
+let pendingWrite = Promise.resolve();
+
+function configWrite(action) {
+  const task = pendingWrite.then(action);
+  pendingWrite = task.catch(() => {});
+  return task;
+}
 
 function cleanKey(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
 
+function validateKey(value) {
+  const key = cleanKey(value);
+  if (/[\x00-\x1f\x7f]/.test(key)) throw new Error('API keys cannot contain line breaks or control characters.');
+  return key;
+}
+
+function credentialScope(profile) {
+  try { return JSON.stringify([profile.provider, canonicalEndpoint(profile.endpoint)]); }
+  catch { return ''; }
+}
+
+function keyFor(keys, profile) {
+  const record = keys[profile.id];
+  return record?.scope && record.scope === credentialScope(profile) ? record.value : '';
+}
+
 async function readState() {
   const stored = await chrome.storage.local.get([CONFIG_KEY, KEYS_KEY]);
   const config = normalizeLlmConfig(stored[CONFIG_KEY]);
-  const keys = stored[KEYS_KEY] && typeof stored[KEYS_KEY] === 'object' ? stored[KEYS_KEY] : {};
-  return { config, keys };
+  const oldKeys = stored[KEYS_KEY] || {};
+  const keys = Object.create(null);
+  for (const profile of config.profiles) {
+    if (!Object.hasOwn(oldKeys, profile.id)) continue;
+    const record = oldKeys[profile.id];
+    const scope = credentialScope(profile);
+    if (!scope) continue;
+    if (record?.scope === scope && cleanKey(record.value)) keys[profile.id] = record;
+    // Old keys had no destination binding. Preserve only keys on the built-in endpoint.
+    else if (cleanKey(record) && scope === credentialScope({ ...profile, endpoint: providerSpecFor(profile).defaultEndpoint })) {
+      keys[profile.id] = { scope, value: cleanKey(record) };
+    }
+  }
+  return { config, keys, needsMigration: !stored[CONFIG_KEY] || JSON.stringify(oldKeys) !== JSON.stringify(keys) };
 }
 
 function sanitize(config, keys) {
@@ -25,8 +61,8 @@ function sanitize(config, keys) {
     ...config,
     profiles: config.profiles.map((profile) => ({
       ...profile,
-      hasKey: !!keys[profile.id],
-      keyHint: keys[profile.id] ? String(keys[profile.id]).slice(-4) : '',
+      hasKey: !!keyFor(keys, profile),
+      keyHint: keyFor(keys, profile).slice(-4),
     })),
   };
 }
@@ -37,37 +73,33 @@ async function persist(config, keys) {
   return view;
 }
 
-export async function getLlmConfig() {
-  const { config, keys } = await readState();
-  const view = sanitize(config, keys);
-  const stored = await chrome.storage.local.get(CONFIG_KEY);
-  if (!stored[CONFIG_KEY]) await chrome.storage.local.set({ [CONFIG_KEY]: view });
-  return view;
+export function getLlmConfig() {
+  return configWrite(async () => {
+    const { config, keys, needsMigration } = await readState();
+    return needsMigration ? persist(config, keys) : sanitize(config, keys);
+  });
 }
 
-export async function saveLlmProfile(message = {}) {
+export function saveLlmProfile(message = {}) {
+  return configWrite(() => saveProfile(message));
+}
+
+async function saveProfile(message) {
   const { config, keys } = await readState();
   const draft = message.profile && typeof message.profile === 'object' ? message.profile : {};
   const profile = normalizeProfile(draft, config.profiles.length);
   if (profile.provider === 'ollama') profile.endpoint = 'http://127.0.0.1:11434';
-  try {
-    const url = new URL(profile.endpoint);
-    if (!/^https?:$/.test(url.protocol)) throw new Error();
-  } catch {
-    throw new Error('Enter a valid http(s) endpoint.');
-  }
+  profile.endpoint = canonicalEndpoint(profile.endpoint);
   if (!profile.model) throw new Error('Enter a model name.');
   if (config.profiles.some((row) => row.id === profile.id && row.id !== draft.id)) profile.id = crypto.randomUUID();
-  const key = cleanKey(message.key);
-  if (message.clearKey) delete keys[profile.id];
-  if (key) keys[profile.id] = key;
-  profile.hasKey = !!keys[profile.id];
-  profile.keyHint = keys[profile.id] ? keys[profile.id].slice(-4) : '';
+  const key = validateKey(message.key);
+  if (message.clearKey || !keyFor(keys, profile)) delete keys[profile.id];
+  if (key) keys[profile.id] = { scope: credentialScope(profile), value: key };
   profile.lastUsedAt = Date.now();
   const index = config.profiles.findIndex((row) => row.id === profile.id);
   if (index >= 0) config.profiles[index] = profile;
   else config.profiles.push(profile);
-  if (config.profiles.length > 50) config.profiles = config.profiles.slice(-50);
+  if (config.profiles.length > 50) delete keys[config.profiles.shift().id];
   config.activeProfileId = profile.id;
   if (message.assistantName !== undefined) {
     profile.name = String(message.assistantName || '').trim().slice(0, 32);
@@ -76,7 +108,11 @@ export async function saveLlmProfile(message = {}) {
   return { config: saved, profileId: profile.id };
 }
 
-export async function activateLlmProfile(id) {
+export function activateLlmProfile(id) {
+  return configWrite(() => activateProfile(id));
+}
+
+async function activateProfile(id) {
   const { config, keys } = await readState();
   const profile = config.profiles.find((row) => row.id === id);
   if (!profile) throw new Error('That saved LLM profile no longer exists.');
@@ -85,42 +121,52 @@ export async function activateLlmProfile(id) {
   return { config: await persist(config, keys), profileId: profile.id };
 }
 
-export async function deleteLlmProfile(id) {
+export function deleteLlmProfile(id) {
+  return configWrite(() => deleteProfile(id));
+}
+
+async function deleteProfile(id) {
   const { config, keys } = await readState();
   const before = config.profiles.length;
   config.profiles = config.profiles.filter((row) => row.id !== id);
   delete keys[id];
-  if (!config.profiles.length) config.profiles = defaultLlmConfig().profiles;
-  if (config.activeProfileId === id || !config.profiles.some((row) => row.id === config.activeProfileId)) {
-    config.activeProfileId = config.profiles[0].id;
-  }
   if (config.profiles.length === before) throw new Error('That saved LLM profile no longer exists.');
+  if (config.activeProfileId === id || !config.profiles.some((row) => row.id === config.activeProfileId)) {
+    config.activeProfileId = config.profiles[0]?.id || '';
+  }
   return { config: await persist(config, keys), profileId: config.activeProfileId };
 }
 
 export async function revealLlmKey(id) {
-  const { keys } = await readState();
-  const key = keys[id];
+  const { config, keys } = await readState();
+  const profile = config.profiles.find((row) => row.id === id);
+  const key = profile ? keyFor(keys, profile) : '';
   if (!key) throw new Error('No API key is saved for this profile.');
   return { key, hint: maskKey(key.slice(-4)) };
 }
 
-export async function activeOllamaModel() {
+export async function activeOllamaModel(profileId, destination) {
   const { config } = await readState();
-  const profile = activeProfile(config);
-  return profile?.provider === 'ollama' ? profile.model : '';
+  const profile = config.profiles.find((row) => row.id === profileId);
+  if (profile?.provider !== 'ollama' || profileDestination(profile) !== destination) {
+    throw new Error('The Ollama profile changed. Review the destination and try again.');
+  }
+  return profile.model;
 }
 
-async function chatProfile(profileId) {
+async function chatProfile(profileId, destination) {
   const { config, keys } = await readState();
   const profile = profileId
     ? config.profiles.find((row) => row.id === profileId)
     : activeProfile(config);
   if (!profile) throw new Error('Configure an LLM profile in Settings → LLM.');
-  return { profile: normalizeProfile(profile), key: keys[profile.id] || '' };
+  if (profileDestination(profile) !== destination) {
+    throw new Error('The LLM profile changed. Review the destination and try again.');
+  }
+  return { profile, key: keyFor(keys, profile) };
 }
 
-function friendlyFetchError(error, endpoint, profile) {
+function friendlyFetchError(error, endpoint, profile, key = '') {
   if (error?.name === 'AbortError') return error;
   let origin = endpoint;
   try { origin = new URL(endpoint).origin; } catch {}
@@ -131,7 +177,7 @@ function friendlyFetchError(error, endpoint, profile) {
   if (error instanceof TypeError) {
     return new Error('Could not reach ' + origin + '. Check the base URL and grant host access for custom domains.');
   }
-  return new Error(label + ': ' + (error?.message || String(error)));
+  return new Error(label + ': ' + scrubKey(error?.message || String(error), key));
 }
 
 async function ensureHostAccess(profile) {
@@ -172,13 +218,22 @@ function usageFor(value) {
   };
 }
 
-function providerError(status, raw, profile, endpoint) {
+function scrubKey(text, key) {
+  let out = String(text);
+  if (!key) return out;
+  out = out.split(key).join('[API key]');
+  const encoded = encodeURIComponent(key);
+  if (encoded !== key) out = out.split(encoded).join('[API key]');
+  return out;
+}
+
+function providerError(status, raw, profile, endpoint, key) {
   let detail = raw;
   try {
     const data = JSON.parse(raw);
     detail = data?.error?.message || data?.error || data?.message || raw;
   } catch {}
-  detail = String(detail || '').replace(/\s+/g, ' ').trim().slice(0, 300);
+  detail = scrubKey(detail || '', key).replace(/\s+/g, ' ').trim().slice(0, 300);
   const label = profile?.label || providerSpecFor(profile).label || 'The provider';
   let message;
   if (status === 401) message = 'API key rejected by ' + label + ' (401). Check the key and try again.';
@@ -192,6 +247,18 @@ function providerError(status, raw, profile, endpoint) {
   error.status = status;
   error.endpoint = endpoint;
   return error;
+}
+
+function boundedResponse(response, maxBytes = 4 * 1024 * 1024) {
+  if (!response.body) throw new Error('The provider returned an empty response.');
+  let bytes = 0;
+  return new Response(response.body.pipeThrough(new TransformStream({
+    transform(chunk, controller) {
+      bytes += chunk.byteLength;
+      if (bytes > maxBytes) throw new Error('The provider response exceeded the size limit.');
+      controller.enqueue(chunk);
+    },
+  })), { headers: response.headers });
 }
 
 function parseModelIds(data) {
@@ -209,12 +276,11 @@ async function requestChat(profile, key, messages, thinking, signal) {
   if (providerKeyRequired(profile) && !key) {
     throw new Error('Add an API key for ' + profile.label + ' in Settings → LLM.');
   }
-  await ensureHostAccess(profile);
   const endpoint = chatEndpoint(profile);
   if (!endpoint) throw new Error('Enter a valid base URL in Settings → LLM.');
   const spec = providerSpecFor(profile);
   const body = { model: profile.model, messages, stream: true };
-  if (profile.provider === 'anthropic') body.max_tokens = 4096;
+  body.max_tokens = 4096;
   if (!spec.local) body.stream_options = { include_usage: true };
   const effort = reasoningEffort(thinking || profile.thinking);
   if (effort) body.reasoning_effort = effort;
@@ -226,13 +292,13 @@ async function requestChat(profile, key, messages, thinking, signal) {
   const send = async () => {
     try {
       const response = await fetch(endpoint, {
-        method: 'POST', headers, body: JSON.stringify(body), signal, credentials: 'omit',
+        method: 'POST', headers, body: JSON.stringify(body), signal, credentials: 'omit', redirect: 'error',
       });
       if (response.ok) return { response };
-      return { status: response.status, raw: await response.text().catch(() => '') };
+      return { status: response.status, raw: await boundedResponse(response, 65536).text() };
     } catch (error) {
       signal.throwIfAborted();
-      throw friendlyFetchError(error, endpoint, profile);
+      throw friendlyFetchError(error, endpoint, profile, key);
     }
   };
   let result = await send();
@@ -244,8 +310,13 @@ async function requestChat(profile, key, messages, thinking, signal) {
     delete body.reasoning_effort;
     result = await send();
   }
+  if (result.status === 400 && /max_completion_tokens|unsupported.{0,60}max_tokens/i.test(result.raw)) {
+    body.max_completion_tokens = body.max_tokens;
+    delete body.max_tokens;
+    result = await send();
+  }
   if (result.response) return result.response;
-  throw providerError(result.status, result.raw, profile, endpoint);
+  throw providerError(result.status, result.raw, profile, endpoint, key);
 }
 
 async function fetchProviderModels(profile, key, signal) {
@@ -259,16 +330,16 @@ async function fetchProviderModels(profile, key, signal) {
   const started = Date.now();
   let response;
   try {
-    response = await fetch(endpoint, { headers, signal, credentials: 'omit' });
+    response = await fetch(endpoint, { headers, signal, credentials: 'omit', redirect: 'error' });
   } catch (error) {
     signal.throwIfAborted();
-    throw friendlyFetchError(error, endpoint, profile);
+    throw friendlyFetchError(error, endpoint, profile, key);
   }
   if (!response.ok) {
-    const raw = await response.text().catch(() => '');
-    throw providerError(response.status, raw, profile, endpoint);
+    const raw = await boundedResponse(response, 65536).text();
+    throw providerError(response.status, raw, profile, endpoint, key);
   }
-  const data = await response.json().catch(() => null);
+  const data = await boundedResponse(response).json();
   return { models: parseModelIds(data), endpoint, latency: Date.now() - started };
 }
 
@@ -281,36 +352,34 @@ async function testChat(profile, key, signal) {
     model: profile.model,
     messages: [{ role: 'user', content: 'Reply with OK.' }],
     stream: false,
+    max_tokens: 16,
   };
-  if (profile.provider === 'ollama') body.options = { num_predict: 1 };
-  else body.max_tokens = 1;
   const headers = {
     Accept: 'application/json',
     'Content-Type': 'application/json',
     ...providerHeaders(profile, key, 'chat'),
   };
-  const started = Date.now();
   const send = async () => {
     try {
       const response = await fetch(endpoint, {
-        method: 'POST', headers, body: JSON.stringify(body), signal, credentials: 'omit',
+        method: 'POST', headers, body: JSON.stringify(body), signal, credentials: 'omit', redirect: 'error',
       });
       if (response.ok) return { response };
-      return { status: response.status, raw: await response.text().catch(() => '') };
+      return { status: response.status, raw: await boundedResponse(response, 65536).text() };
     } catch (error) {
       signal.throwIfAborted();
-      throw friendlyFetchError(error, endpoint, profile);
+      throw friendlyFetchError(error, endpoint, profile, key);
     }
   };
   let result = await send();
   if (result.status === 400 && body.max_tokens && /max_tokens|max_completion_tokens/i.test(result.raw)) {
+    body.max_completion_tokens = body.max_tokens;
     delete body.max_tokens;
     result = await send();
   }
-  if (!result.response) throw providerError(result.status, result.raw, profile, endpoint);
-  const data = await result.response.json().catch(() => null);
-  const content = data?.choices?.[0]?.message?.content || data?.message?.content || '';
-  return { content: String(content), latency: Date.now() - started };
+  if (!result.response) throw providerError(result.status, result.raw, profile, endpoint, key);
+  const data = await boundedResponse(result.response).json();
+  if (!Array.isArray(data?.choices) || !data.choices.length) throw new Error('The selected model did not return a chat response.');
 }
 
 async function requestProfile(message = {}) {
@@ -319,21 +388,26 @@ async function requestProfile(message = {}) {
   const source = message.profile && typeof message.profile === 'object' ? message.profile : saved;
   if (!source) throw new Error('Configure an LLM profile in Settings → LLM.');
   const profile = normalizeProfile(source);
-  if (profile.provider === 'ollama') profile.endpoint = 'http://127.0.0.1:11434';
-  let key = cleanKey(message.key);
-  if (!key && saved && saved.provider === profile.provider) key = keys[saved.id] || '';
+  profile.endpoint = canonicalEndpoint(profile.endpoint);
+  let key = validateKey(message.key);
+  if (!key && saved && credentialScope(saved) === credentialScope(profile)) key = keyFor(keys, saved);
   return { profile, key, savedId: saved?.id || null };
 }
 
 export async function listLlmModels(message = {}) {
   const { profile, key } = await requestProfile(message);
-  const result = await fetchProviderModels(profile, key, AbortSignal.timeout(15000));
-  return {
-    provider: profile.provider,
-    endpoint: result.endpoint,
-    models: result.models,
-    latency: result.latency,
-  };
+  try {
+    const result = await fetchProviderModels(profile, key, AbortSignal.timeout(15000));
+    return {
+      provider: profile.provider,
+      endpoint: result.endpoint,
+      models: result.models,
+      latency: result.latency,
+    };
+  } catch (error) {
+    error.message = scrubKey(error.message || String(error), key);
+    throw error;
+  }
 }
 
 export async function testLlmConnection(message = {}) {
@@ -345,33 +419,45 @@ export async function testLlmConnection(message = {}) {
   let models = [];
   let modelError;
   try {
-    const listed = await fetchProviderModels(profile, key, AbortSignal.timeout(15000));
-    models = listed.models;
-    if (models.length) {
-      return {
-        ok: true, mode: 'models', provider: profile.provider, models,
-        latency: listed.latency,
-      };
+    try {
+      const listed = await fetchProviderModels(profile, key, AbortSignal.timeout(15000));
+      models = listed.models;
+      if (profile.provider === 'ollama') {
+        if (!profile.model) {
+          if (!models.length) throw new Error('Ollama is reachable, but no models are installed.');
+          return {
+            ok: true, mode: 'models', provider: profile.provider, models,
+            latency: listed.latency,
+          };
+        }
+        if (!models.some((model) => model === profile.model || model === profile.model + ':latest')) {
+          throw new Error('Ollama is reachable, but it does not list the selected model.');
+        }
+        return {
+          ok: true, mode: 'models', provider: profile.provider, models,
+          latency: listed.latency,
+        };
+      }
+    } catch (error) {
+      modelError = error;
+      if (profile.provider === 'ollama' || error.code === 'HOST_ACCESS' || [401, 403, 429].includes(error.status)
+        || (error.status >= 500 && error.status < 600) || (!error.status && !/404|405/.test(error.message))) {
+        throw error;
+      }
     }
-    if (profile.provider === 'ollama') {
-      throw new Error('Ollama is reachable but reports no installed models. Pull a model first.');
+    if (!profile.model) {
+      if (modelError) throw modelError;
+      throw new Error('The provider returned no models. Enter a model ID and test again.');
     }
+    await testChat(profile, key, AbortSignal.timeout(12000));
+    return {
+      ok: true, mode: 'chat', provider: profile.provider, models,
+      latency: Date.now() - started,
+    };
   } catch (error) {
-    modelError = error;
-    if (error.code === 'HOST_ACCESS' || [401, 403, 429].includes(error.status)
-      || (error.status >= 500 && error.status < 600) || (!error.status && !/404|405/.test(error.message))) {
-      throw error;
-    }
+    error.message = scrubKey(error.message || String(error), key);
+    throw error;
   }
-  if (!profile.model) {
-    if (modelError) throw modelError;
-    throw new Error('The provider returned no models. Enter a model ID and test again.');
-  }
-  const chat = await testChat(profile, key, AbortSignal.timeout(30000));
-  return {
-    ok: true, mode: 'chat', provider: profile.provider, models,
-    latency: Date.now() - started, reply: chat.content.slice(0, 40),
-  };
 }
 
 
@@ -393,7 +479,10 @@ function makeStreamReader() {
       const delta = choice.delta || choice.message || {};
       const next = extractText(delta.content ?? choice.text);
       const reasoning = extractText(delta.reasoning_content) || extractText(delta.reasoning) || extractText(delta.thinking);
-      if (next) content += next;
+      if (next) {
+        content += next;
+        if (content.length > 262144) throw new Error('The provider answer exceeded the display limit.');
+      }
       if (reasoning) thought = true;
       if (choice.finish_reason) finish = String(choice.finish_reason);
     }
@@ -426,11 +515,15 @@ function makeStreamReader() {
 async function readStream(response, signal, onUpdate) {
   const reader = makeStreamReader();
   const contentType = response.headers.get('content-type') || '';
+  response = boundedResponse(response);
   if (/application\/json/i.test(contentType) && !/event-stream/i.test(contentType)) {
     const raw = await response.text();
     let whole = null;
     try { whole = JSON.parse(raw); } catch {}
-    if (whole) reader.apply(whole);
+    if (whole) {
+      reader.apply(whole);
+      if (Array.isArray(whole.choices) && whole.choices[0]?.message) reader.apply({ done: true });
+    }
     else for (const line of raw.split(/\r?\n/)) reader.parseLine(line);
     onUpdate(reader);
   } else {
@@ -444,6 +537,7 @@ async function readStream(response, signal, onUpdate) {
         buffer += value;
         const lines = buffer.split(/\r?\n/);
         buffer = lines.pop();
+        if (buffer.length > 512 * 1024) throw new Error('The provider returned an oversized stream event.');
         for (const line of lines) {
           reader.parseLine(line);
           if (reader.done) break;
@@ -462,10 +556,31 @@ async function readStream(response, signal, onUpdate) {
   return reader;
 }
 
+export async function performLlmChat({ profile, key, messages, thinking }, send) {
+  const signal = AbortSignal.timeout(15 * 60000);
+  try {
+    const response = await requestChat(profile, key, messages, thinking, signal);
+    let last = 0;
+    const reader = await readStream(response, signal, (state) => {
+      if ((!state.content && !state.thinking) || Date.now() - last < 100) return;
+      last = Date.now();
+      send({ type: 'update', content: state.content, thinking: state.thinking, usage: state.usage });
+    });
+    signal.throwIfAborted();
+    if (!reader.done && !reader.finish) throw new Error('The provider stream ended before the model finished. Try again.');
+    if (!reader.content.trim() && !reader.thinking) {
+      throw new Error('The model returned no answer text. Check the model name and try again.');
+    }
+    send({ type: 'done', content: reader.content, thinking: reader.thinking, usage: reader.usage, finish: reader.finish });
+  } catch (error) {
+    throw new Error(scrubKey(error.message, key));
+  }
+}
+
 export function connectLlmChat(port) {
   let started = false;
   let connected = true;
-  let controller = null;
+  let cancel;
   const send = (message) => {
     if (!connected) return;
     try { port.postMessage(message); } catch {}
@@ -473,41 +588,27 @@ export function connectLlmChat(port) {
   port.onDisconnect.addListener(() => {
     void chrome.runtime.lastError;
     connected = false;
-    controller?.abort();
+    cancel?.();
   });
   port.onMessage.addListener((message) => {
-    if (message?.type === 'cancel') {
-      controller?.abort();
-      return;
-    }
     if (started || message?.type !== 'start') return;
     started = true;
-    controller = new AbortController();
     (async () => {
-      const { profile, key } = await chatProfile(message.profileId);
+      const { profile, key } = await chatProfile(message.profileId, message.destination);
       if (profile.provider === 'ollama') throw new Error('Ollama uses the local model connection, not the remote API.');
-      if (!Array.isArray(message.messages) || !message.messages.length) throw new Error('The question had no prompt.');
+      if (!Array.isArray(message.messages) || !message.messages.length || message.messages.length > 200
+        || message.messages.some((item) => !['system', 'user', 'assistant'].includes(item?.role) || typeof item.content !== 'string')
+        || new Blob([JSON.stringify(message.messages)]).size > 4 * 1024 * 1024) {
+        throw new Error('The prompt is invalid or exceeds the size limit.');
+      }
       if (providerKeyRequired(profile) && !key) {
         throw new Error('Add an API key for ' + profile.label + ' in Settings → LLM.');
       }
-      const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(15 * 60000)]);
-      const response = await requestChat(profile, key, message.messages, message.thinking, signal);
-      let last = '';
-      const reader = await readStream(response, signal, (state) => {
-        if (!state.content && !state.thinking) return;
-        const snapshot = state.content + '\u0000' + (state.thinking ? '1' : '0');
-        if (snapshot === last) return;
-        last = snapshot;
-        send({ type: 'update', content: state.content, thinking: state.thinking, usage: state.usage });
-      });
-      signal.throwIfAborted();
-      if (!reader.content.trim() && !reader.thinking) {
-        throw new Error('The model returned no answer text. Check the model name and try again.');
-      }
-      send({ type: 'done', content: reader.content, thinking: reader.thinking, usage: reader.usage, finish: reader.finish });
+      await ensureHostAccess(profile);
+      if (!connected) return;
+      cancel = relayOffscreen('provider-chat', { profile, key, messages: message.messages, thinking: message.thinking }, send);
     })().catch((error) => {
-      if (controller?.signal.aborted) return;
-      send({ type: 'error', error: error.message || String(error) });
+      send({ type: 'error', error: error.message || String(error), code: error.code });
     });
   });
 }

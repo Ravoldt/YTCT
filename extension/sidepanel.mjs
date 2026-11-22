@@ -1,12 +1,13 @@
 import { CommentsView } from './comments-view.mjs';
 import { renderAnswer } from './answer-view.mjs';
-import { askOllama, availableVram, DEFAULT_MODEL, loadedModel } from './ollama.mjs';
+import { askOllama, loadedModel } from './ollama.mjs';
 import { askRemote, messageTokens } from './remote.mjs';
+import { normalizeEntry, normalizeTranscript } from './export-entry.mjs';
 // Provider presets and model discovery adapted from Cline (Apache-2.0).
-// See LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
+// See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
 import {
   PROVIDER_GROUPS, PROVIDERS, activeProfile, assistantLabel, defaultLlmConfig, defaultProfile,
-  maskKey, originPattern, providerOrigin, providerSpec,
+  canonicalEndpoint, endpointUrl, isLoopback, maskKey, originPattern, profileDestination, providerOrigin, providerSpec,
 } from './llm-config.mjs';
 
 const byId = (id) => document.getElementById(id);
@@ -39,10 +40,25 @@ let llmRevealTimer;
 const llmModelsByProvider = new Map();
 let settingsTab = 'general';
 let history = [];
+let historyDestination = '';
+let historyHasTranscript = false;
+const approvedScopes = new Set();
 let closing = false;
 let reconnect;
 
 const activeLlm = () => activeProfile(llm);
+
+function destinationOf(profile) {
+  try { return profileDestination(profile); } catch { return ''; }
+}
+
+function setLlmConfig(next) {
+  const before = destinationOf(activeLlm());
+  llm = next;
+  if (destinationOf(activeLlm()) === before) return;
+  if (job || history.length || leaseRequested) clearChat();
+  approvedScopes.clear();
+}
 
 const viewer = new CommentsView({
   list: byId('comments'), count: byId('count'), follow: byId('follow'), timestampOnly: byId('timestamp-only'),
@@ -71,12 +87,13 @@ function applyAssistantName() {
     const placeholder = 'Ask ' + name + ' about these comments';
     query.placeholder = placeholder;
     query.setAttribute('aria-label', placeholder);
+    if (!job) byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
   }
 }
 
 async function loadLlmConfig() {
   try {
-    llm = await worker('llm-config');
+    setLlmConfig(await worker('llm-config'));
   } catch {
     return;
   }
@@ -89,7 +106,9 @@ async function loadLlmConfig() {
 
 async function worker(type, payload = {}) {
   const response = await chrome.runtime.sendMessage({ type, ...payload });
-  if (!response?.ok) throw new Error(response?.error || 'The extension worker is unavailable.');
+  if (!response?.ok) throw Object.assign(new Error(response?.error || 'The extension worker is unavailable.'), {
+    status: response?.status, code: response?.code,
+  });
   return response.value;
 }
 
@@ -128,6 +147,17 @@ function stopAsking() {
   return release();
 }
 
+function clearChat() {
+  stopAsking();
+  history = [];
+  historyDestination = '';
+  historyHasTranscript = false;
+  chat.replaceChildren();
+  byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
+  chrome.storage.session.remove('chat:' + tabId).catch(() => {});
+  updateComposer();
+}
+
 function setMode(next) {
   if (next === mode) return;
   if (mode === 'search') searchDraft = query.value;
@@ -147,7 +177,7 @@ function setMode(next) {
   viewer.setQuery(ai ? '' : searchDraft);
   if (!ai) stopAsking();
   else {
-    byId('ai-status').textContent = 'Ready';
+    byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
     chat.scrollTop = chat.scrollHeight;
   }
   updateComposer();
@@ -164,6 +194,9 @@ function resetView(info) {
   questionDraft = '';
   query.value = '';
   history = [];
+  historyDestination = '';
+  historyHasTranscript = false;
+  approvedScopes.clear();
   chat.replaceChildren();
   byId('telemetry').hidden = true;
   clearCost();
@@ -188,12 +221,16 @@ function updatePageHeader() {
   if (state) document.documentElement.dataset.theme = state.dark ? 'dark' : 'light';
   const progress = state?.progress || {};
   const partial = state?.entry?.snapshot?.collection?.status === 'partial';
-  byId('collection').hidden = !state || !!state.entry && !progress.running && !partial;
+  const limitReached = !!state?.entry?.snapshot?.collection?.limitReached;
+  byId('collection').hidden = !state;
+  byId('download-export').hidden = !state?.entry;
+  byId('collect').hidden = !!state?.entry && !progress.running && (!partial || limitReached);
   byId('collect').textContent = progress.running ? 'Stop' : partial ? 'Resume' : 'Collect';
   byId('collection-status').textContent = progress.running
     ? 'Collecting' + (progress.count ? ' · ' + progress.count.toLocaleString() : '') + '…'
     : progress.status === 'stopped' ? 'Collection stopped'
-      : partial ? 'Partial export' : progress.reason || 'Comments haven’t been collected';
+      : limitReached ? 'Partial export · size limit reached'
+        : partial ? 'Partial export' : state?.entry ? 'Comments ready' : progress.reason || 'Comments haven’t been collected';
 }
 
 function adoptEntry(entry) {
@@ -222,29 +259,31 @@ function linksForTurn(turn) {
 
 async function preparePage(current) {
   try {
-    const cached = await tab('load');
+    const identity = { key: current.key, pageId: current.pageId };
+    const [cached, collected] = await Promise.all([worker('read-cache', identity), tab('load-collected')]);
     if (state !== current) return;
-    adoptEntry(cached);
-    await worker('mark-used', { key: current.key });
+    if (!current.entry) {
+      if (collected && collected.snapshot?.exportedAt !== cached?.snapshot?.exportedAt && !cached?.markdown) {
+        await receiveEntry(current, collected);
+      } else adoptEntry(cached);
+    }
+    if (cached) await worker('mark-used', identity);
     if (state !== current) return;
+    await loadLlmConfig();
     const { ['chat:' + tabId]: saved } = await chrome.storage.session.get('chat:' + tabId);
     if (state === current && saved?.pageId === current.pageId && saved.key === current.key
+      && saved.destination && saved.destination === destinationOf(activeLlm())
+      && saved.shareTranscript === (settings.shareTranscript && current.key.startsWith('video:'))
       && Array.isArray(saved.history) && !history.length && !job) {
+      historyDestination = saved.destination;
+      historyHasTranscript = saved.shareTranscript;
       history = saved.history;
       for (const turn of history) {
         if (turn.role === 'assistant') renderAnswer(bubble('assistant'), turn.content, linksForTurn(turn), actions);
         else bubble('user', turn.content);
       }
     }
-    if (state === current && !current.entry) {
-      try {
-        const entry = await tab('collect');
-        if (state === current) adoptEntry(entry);
-      }
-      catch {
-        if (state === current && !current.entry) viewer.showEmpty('Use Collect to load comments from this YouTube page.');
-      }
-    }
+    if (state === current && !current.entry) viewer.showEmpty('Use Collect to load comments from this YouTube page.');
   } catch (error) {
     if (state === current) notice(error.message);
   }
@@ -287,7 +326,7 @@ function accept(message) {
   if (message.event === 'time') viewer.tick(message.media, !!message.seek);
   if (message.event === 'notice') notice(message.text);
   if (message.event === 'export' && message.pageId === state.pageId) {
-    adoptEntry(message.entry);
+    receiveEntry(state, message.entry).catch((error) => notice(error.message));
     if (message.notice) notice(message.notice);
   }
 }
@@ -396,10 +435,9 @@ function clearCost() {
 }
 
 
-function vramChoice(gpu, signal, model) {
-  const text = gpu ? (gpu.free_mib / 1024).toFixed(1) + ' GiB of free GPU memory was reported.'
-    : 'The local VRAM helper did not report available GPU memory.';
-  byId('confirm-description').textContent = text + ' Load ' + (model || DEFAULT_MODEL) + ' anyway? Part of the model may run on the CPU.';
+function confirmAction(text, label, signal) {
+  byId('confirm-description').textContent = text;
+  byId('confirm-load').textContent = label;
   byId('confirm').hidden = false;
   return new Promise((resolve) => {
     const accept = () => finish(true);
@@ -416,8 +454,50 @@ function vramChoice(gpu, signal, model) {
       byId('confirm-load').addEventListener('click', accept);
       byId('cancel-load').addEventListener('click', cancel);
       signal.addEventListener('abort', cancel, { once: true });
+      byId('confirm-load').focus();
     }
   });
+}
+
+async function confirmSharing(profile, destination, includeTranscript, signal) {
+  const scope = JSON.stringify([destination, includeTranscript]);
+  if (approvedScopes.has(scope)) return true;
+  const endpoint = endpointUrl(profile.endpoint);
+  const text = 'Send to ' + canonicalEndpoint(profile.endpoint) + ' (' + profile.model + ')? Ask sends your question, earlier turns for this profile, and source details such as the YouTube link, commenter names, and comment text, including from loaded exports.'
+    + (includeTranscript ? ' It may include video captions.' : '')
+    + (profile.provider === 'ollama' ? ' It may include a thumbnail or post images.' : '')
+    + (isLoopback(endpoint) ? ' Your local server may forward requests to a cloud model.' : ' The provider handles the request under its own terms.');
+  if (!await confirmAction(text, 'Send for this visit', signal)) return false;
+  approvedScopes.add(scope);
+  return true;
+}
+
+async function boundedImageBlob(response, maxBytes = 5 * 1024 * 1024) {
+  const length = Number(response.headers.get('content-length'));
+  if (Number.isFinite(length) && length > maxBytes) return null;
+  const type = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+  if (!type.startsWith('image/')) return null;
+  if (!response.body) {
+    const blob = await response.blob();
+    return blob.size > 0 && blob.size <= maxBytes && blob.type.startsWith('image/') ? blob : null;
+  }
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) return null;
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const blob = new Blob(chunks, { type });
+  return blob.size > 0 && blob.size <= maxBytes ? blob : null;
 }
 
 async function sourceImages(meta, signal) {
@@ -426,11 +506,14 @@ async function sourceImages(meta, signal) {
   for (const raw of urls) {
     try {
       const url = new URL(raw);
-      if (url.protocol !== 'https:' || !['i.ytimg.com', 'yt3.ggpht.com', 'yt3.googleusercontent.com'].includes(url.hostname)) continue;
-      const response = await fetch(url, { credentials: 'omit', signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]) });
+      if (url.protocol !== 'https:' || url.port || url.username || url.password
+        || !['i.ytimg.com', 'yt3.ggpht.com', 'yt3.googleusercontent.com'].includes(url.hostname)) continue;
+      const response = await fetch(url, {
+        credentials: 'omit', redirect: 'error', signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+      });
       if (!response.ok) continue;
-      const blob = await response.blob();
-      if (blob.size > 5 * 1024 * 1024 || !blob.type.startsWith('image/')) continue;
+      const blob = await boundedImageBlob(response);
+      if (!blob) continue;
       const encoded = await new Promise((resolve, reject) => {
         const reader = new FileReader();
         reader.onload = () => resolve(String(reader.result).split(',')[1]);
@@ -463,23 +546,24 @@ async function ask(question) {
     await releasePending;
     signal.throwIfAborted();
     if (!profile) throw new Error('Configure an LLM profile in Settings → LLM.');
+    const destination = profileDestination(profile);
+    if (!await hasHostAccess(profile.endpoint)) throw new Error('Allow network access for this endpoint in Settings → LLM.');
+    signal.throwIfAborted();
+    const includeTranscript = options.shareTranscript && current.key.startsWith('video:');
+    if (!await confirmSharing(profile, destination, includeTranscript, signal)) return;
+    signal.throwIfAborted();
+    if (historyDestination !== destination || historyHasTranscript !== includeTranscript) {
+      history = [];
+      chat.replaceChildren();
+      historyDestination = destination;
+      historyHasTranscript = includeTranscript;
+    }
     beginCost(profile);
     let acquired = { resident: null };
     if (profile.provider === 'ollama') {
       status('Checking Ollama…');
-      const resident = await loadedModel(profile.model);
-      signal.throwIfAborted();
-      if (!resident) {
-        const gpu = await availableVram();
-        signal.throwIfAborted();
-        if ((!gpu || gpu.free_mib < 10240) && !await vramChoice(gpu, signal, profile.model)) {
-          status('Ready');
-          clearCost();
-          return;
-        }
-      }
       leaseRequested = true;
-      acquired = await worker('model-acquire');
+      acquired = await worker('model-acquire', { profileId: profile.id, destination });
       signal.throwIfAborted();
       status(acquired.resident ? 'Waiting for Ollama…' : 'Loading ' + profile.model + '…');
       updateTelemetry(null, options.contextWindow, acquired.resident, profile);
@@ -490,16 +574,14 @@ async function ask(question) {
       updateTelemetry(null, options.contextWindow, null, profile);
     }
     const entry = current.entry;
-    if (options.includeTranscript && current.key.startsWith('video:') && !entry.transcript && !current.transcriptTried) {
+    if (includeTranscript && !current.transcript && !current.transcriptTried) {
       current.transcriptTried = true;
       status('Fetching transcript…');
       try {
         const transcript = await tab('transcript');
         signal.throwIfAborted();
-        if (transcript?.ok) {
-          entry.transcript = transcript;
-          await worker('write-cache', { key: current.key, entry, keepAge: true });
-        } else bubble('note', 'Transcript unavailable. ' + (transcript?.reason || ''));
+        current.transcript = normalizeTranscript(transcript);
+        if (!current.transcript) bubble('note', 'Transcript unavailable. ' + (transcript?.reason || ''));
       } catch (error) {
         signal.throwIfAborted();
         bubble('note', 'Transcript unavailable. ' + error.message);
@@ -511,8 +593,11 @@ async function ask(question) {
     const images = wantsImages ? current.images || await sourceImages(meta, signal) : [];
     signal.throwIfAborted();
     if (wantsImages) current.images = images;
-    const session = { entry, meta, key: current.key, contextWindow, commentRows: YTCT.commentRows(entry), images };
-    await worker('mark-used', { key: current.key });
+    const session = {
+      entry: { ...entry, transcript: includeTranscript ? current.transcript : null },
+      meta, key: current.key, contextWindow, commentRows: YTCT.commentRows(entry), images,
+    };
+    await worker('mark-used', { key: current.key, pageId: current.pageId });
     signal.throwIfAborted();
     asked = bubble('user', question);
     answerNode = bubble('assistant');
@@ -557,9 +642,13 @@ async function ask(question) {
     display();
     const citations = [...links.comments].filter(([ref]) => latest.includes(ref));
     history.push({ role: 'user', content: question }, { role: 'assistant', content: latest,
-      duration: links.duration, comments: citations, authors: [...links.authors] });
+      duration: links.duration, comments: citations.slice(0, 300),
+      authors: [...links.authors].filter(([author]) => latest.toLowerCase().includes('@' + author)).slice(0, 300) });
+    history = history.slice(-40);
     success = true;
-    await chrome.storage.session.set({ ['chat:' + tabId]: { pageId: current.pageId, key: current.key, history } }).catch(() => {});
+    await chrome.storage.session.set({
+      ['chat:' + tabId]: { pageId: current.pageId, key: current.key, destination, shareTranscript: includeTranscript, history },
+    }).catch(() => {});
     if (!isCurrent()) return;
     const scope = [];
     if (response.context.truncated) scope.push(response.context.included.toLocaleString() + ' of ' + response.context.total.toLocaleString() + ' source rows sent');
@@ -597,9 +686,52 @@ async function collect(fresh = false) {
   if (!current) return;
   try {
     if (current.progress?.running) return await tab('stop');
-    const entry = await tab('collect', { force: true, fresh });
-    if (current === state) adoptEntry(entry);
+    await tab('collect', { fresh });
   } catch (error) { if (current === state) notice(error.message); }
+}
+
+async function receiveEntry(current, raw) {
+  const entry = normalizeEntry(current.key, raw);
+  if (state !== current) return;
+  adoptEntry(entry);
+  const { reason } = await worker('write-cache', { key: current.key, pageId: current.pageId, entry });
+  if (reason && state === current) notice(reason);
+}
+
+async function downloadExport() {
+  const current = state;
+  if (!current?.entry) return;
+  const button = byId('download-export');
+  button.disabled = true;
+  try {
+    await worker('download-export', { key: current.key, pageId: current.pageId, entry: current.entry });
+  } catch (error) {
+    if (state === current) notice(error.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function loadSavedExport() {
+  const current = state;
+  if (!current) return;
+  try {
+    const identity = { key: current.key, pageId: current.pageId, explicit: true };
+    const entry = await worker('read-cache', identity);
+    if (state !== current) return;
+    if (!entry) return settingsError('There is no saved export for this source.');
+    adoptEntry(entry);
+    await worker('mark-used', identity);
+    closeSettings();
+  } catch (error) { settingsError(error.message); }
+}
+
+async function clearSavedExports() {
+  if (!window.confirm('Delete all saved comment exports from this Chrome profile?')) return;
+  try {
+    await worker('clear-cache');
+    byId('cache-usage').textContent = 'Saved exports cleared.';
+  } catch (error) { settingsError(error.message); }
 }
 
 async function showSettings() {
@@ -653,6 +785,7 @@ function settingsError(text) {
 function setSettingsTab(name) {
   settingsTab = name === 'llm' ? 'llm' : 'general';
   const llmActive = settingsTab === 'llm';
+  if (!llmActive) clearLlmKeyReveal();
   for (const [tab, panel, active] of [
     [byId('settings-tab-general'), byId('settings-general'), !llmActive],
     [byId('settings-tab-llm'), byId('settings-llm'), llmActive],
@@ -678,6 +811,7 @@ function fillLlmSelect() {
   }
   select.replaceChildren(...options);
   select.value = llmEditingId || '';
+  byId('llm-delete').disabled = !llmEditingId;
 }
 
 function populateProviderSelect() {
@@ -737,7 +871,7 @@ function showGrant(origin) {
   if (!origin) return;
   llmGrantOrigin = origin;
   byId('llm-grant-text').textContent = 'Chrome needs one-time network access to ' + origin
-    + ' for this custom endpoint. This grants access to that host only.';
+    + ' for this endpoint. This grants access to that host only.';
   byId('llm-grant').hidden = false;
 }
 
@@ -758,10 +892,9 @@ async function ensureFormHost(endpoint) {
   }
   let url;
   try {
-    url = new URL(endpoint);
-    if (!/^https?:$/.test(url.protocol)) throw new Error();
-  } catch {
-    setLlmStatus('Enter a valid http(s) base URL.', true);
+    url = endpointUrl(endpoint);
+  } catch (error) {
+    setLlmStatus(error.message, true);
     return false;
   }
   if (await hasHostAccess(endpoint)) {
@@ -774,7 +907,7 @@ async function ensureFormHost(endpoint) {
 }
 
 function updateLlmProviderUi() {
-  const provider = byId('llm-provider').value || 'ollama';
+  const provider = byId('llm-provider').value || 'cloud';
   const spec = providerSpec(provider);
   const endpoint = byId('llm-endpoint');
   endpoint.readOnly = provider === 'ollama';
@@ -800,7 +933,7 @@ function updateLlmProviderUi() {
 }
 
 function fillLlmForm(profile, isNew = false) {
-  const draft = profile || defaultProfile('ollama');
+  const draft = profile || defaultProfile('cloud');
   const provider = PROVIDERS[draft.provider] ? draft.provider : 'cloud';
   const spec = providerSpec(provider);
   byId('llm-form-title').textContent = isNew ? 'New profile' : 'Profile details';
@@ -813,7 +946,7 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-output-price').value = draft.pricing?.output ?? 0;
   byId('llm-assistant-name').value = draft.name || '';
   const derived = assistantLabel({ version: 1, activeProfileId: draft.id, profiles: [{ ...draft, name: '' }] });
-  byId('llm-assistant-name').placeholder = derived || 'Gemma';
+  byId('llm-assistant-name').placeholder = derived || 'LLM';
   byId('llm-key').value = '';
   llmKeyClear = false;
   llmProviderChanged = false;
@@ -829,6 +962,14 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-clear-key').disabled = !saved;
   updateLlmProviderUi();
   if (saved) byId('llm-key').placeholder = 'Leave blank to keep ' + maskKey(draft.keyHint);
+  if (!isNew) {
+    const endpoint = byId('llm-endpoint').value;
+    hasHostAccess(endpoint).then((allowed) => {
+      if (!allowed && llmEditingId === draft.id && byId('llm-endpoint').value === endpoint) {
+        showGrant(providerOrigin({ endpoint }));
+      }
+    });
+  }
   llmDirty = false;
 }
 
@@ -841,30 +982,28 @@ function renderLlmSettings() {
     return;
   }
   if (llmEditingId === null) {
-    const provider = byId('llm-provider').value || 'ollama';
-    llmNewDraft ||= defaultProfile(provider);
+    llmNewDraft ||= defaultProfile('cloud');
     llmNewDraft.label = '';
     fillLlmForm(llmNewDraft, true);
   }
 }
 
 function newLlmProfile() {
-  const provider = byId('llm-provider').value || activeLlm()?.provider || 'ollama';
   llmEditingId = null;
-  llmNewDraft = defaultProfile(provider);
+  llmNewDraft = defaultProfile('cloud');
   llmNewDraft.label = '';
   llmKeyClear = false;
   llmProviderChanged = false;
   fillLlmForm(llmNewDraft, true);
   fillLlmSelect();
-  setLlmStatus('New profile. Pick a provider, enter its key, then save or test.');
+  setLlmStatus('New profile. Pick a provider, enter its details, then save or test.');
 }
 
 async function activateLlmProfileById(id) {
   try {
     setLlmStatus('Switching profile…');
     const result = await worker('llm-activate', { id });
-    llm = result.config;
+    setLlmConfig(result.config);
     llmEditingId = result.profileId;
     llmNewDraft = null;
     llmDirty = false;
@@ -884,7 +1023,8 @@ async function activateLlmProfileById(id) {
 }
 
 function applyProviderChange() {
-  const provider = byId('llm-provider').value || 'ollama';
+  clearLlmKeyReveal();
+  const provider = byId('llm-provider').value || 'cloud';
   const spec = providerSpec(provider);
   const saved = llmEditingId ? llm.profiles.find((row) => row.id === llmEditingId) : null;
   llmProviderChanged = !!saved && saved.provider !== provider;
@@ -988,15 +1128,10 @@ async function testConnection() {
     const result = await worker('llm-test', testPayload(values));
     applyModels(result.models, result.provider || values.provider);
     if (!byId('llm-model').value && result.models?.length) byId('llm-model').value = result.models[0];
-    const warned = result.mode !== 'chat' && noteModelChoice(result.models);
-    if (!warned) {
-      setModelStatus(result.mode === 'chat'
-        ? 'Connection verified with ' + (byId('llm-model').value || 'the selected model') + '.'
-        : 'Connected · ' + (result.models?.length || 0) + ' models available.');
-    }
-    setLlmStatus(warned
-      ? 'Connected, but the selected model was not in the provider’s list.'
-      : 'Connected to ' + providerSpec(values.provider).label + '.');
+    setModelStatus(result.mode === 'chat'
+      ? 'The selected model answered a test request.'
+      : 'Ollama is reachable and lists the selected model.');
+    setLlmStatus('Connected to ' + providerSpec(values.provider).label + '.');
   } catch (error) {
     setLlmStatus(error.message, true);
     if (/host access/i.test(error.message)) showGrant(providerOrigin({ endpoint: values.endpoint }));
@@ -1007,38 +1142,13 @@ async function testConnection() {
   }
 }
 
-async function autoTestSaved(profile) {
-  if (llmTesting) return;
+async function showSavedStatus(profile) {
   if (!await hasHostAccess(profile.endpoint)) {
     showGrant(providerOrigin(profile));
     setLlmStatus('Saved ' + profile.label + '. Grant network access for ' + providerOrigin(profile) + ' to connect.', true);
     return;
   }
-  llmTesting = true;
-  setLlmStatus('Saved ' + profile.label + '. Checking models…');
-  try {
-    const result = await worker('llm-models', { profileId: profile.id });
-    const models = applyModels(result.models, result.provider || profile.provider);
-    if (!byId('llm-model').value && models.length) byId('llm-model').value = models[0];
-    const warned = noteModelChoice(models);
-    if (!warned) {
-      setModelStatus(models.length
-        ? 'Connected · ' + models.length + ' models available.'
-        : 'Connected, but the provider returned no model list.');
-    }
-    setLlmStatus(warned
-      ? 'Saved ' + profile.label + '. Connected, but the selected model was not in the provider’s list.'
-      : 'Saved ' + profile.label + ' and connected.');
-  } catch (error) {
-    if (error.status === 404 || error.status === 405) {
-      setLlmStatus('Saved ' + profile.label + '. The provider has no model-list endpoint; click Test to verify a chat.', false);
-    } else {
-      setLlmStatus('Saved ' + profile.label + '. ' + error.message, true);
-      if (/host access/i.test(error.message)) showGrant(providerOrigin(profile));
-    }
-  } finally {
-    llmTesting = false;
-  }
+  setLlmStatus('Saved ' + profile.label + '. Choose Test to check the connection.');
 }
 
 function readLlmForm() {
@@ -1068,10 +1178,9 @@ async function saveLlm() {
     return;
   }
   try {
-    const url = new URL(values.endpoint);
-    if (!/^https?:$/.test(url.protocol)) throw new Error();
-  } catch {
-    setLlmStatus('Enter a valid http(s) base URL.', true);
+    values.endpoint = canonicalEndpoint(values.endpoint);
+  } catch (error) {
+    setLlmStatus(error.message, true);
     return;
   }
   try {
@@ -1090,7 +1199,7 @@ async function saveLlm() {
       clearKey: llmKeyClear || (llmProviderChanged && !values.key.trim()),
       assistantName: values.assistantName,
     });
-    llm = result.config;
+    setLlmConfig(result.config);
     llmEditingId = result.profileId;
     llmNewDraft = null;
     llmDirty = false;
@@ -1106,8 +1215,7 @@ async function saveLlm() {
       setLlmStatus('Saved profile.');
       return;
     }
-    setLlmStatus('Saved ' + profile.label + '.');
-    void autoTestSaved(profile);
+    await showSavedStatus(profile);
   } catch (error) {
     setLlmStatus(error.message, true);
   }
@@ -1123,15 +1231,17 @@ async function deleteLlmProfile() {
   if (!window.confirm('Delete the saved LLM profile “' + profile.label + '”?')) return;
   try {
     const result = await worker('llm-delete', { id: llmEditingId });
-    llm = result.config;
-    llmEditingId = result.profileId;
-    llmNewDraft = null;
+    setLlmConfig(result.config);
+    llmEditingId = result.profileId || null;
+    llmNewDraft = llmEditingId ? null : defaultProfile('cloud');
+    if (llmNewDraft) llmNewDraft.label = '';
     llmDirty = false;
     llmKeyClear = false;
     applyAssistantName();
     fillLlmSelect();
-    const active = llm.profiles.find((row) => row.id === result.profileId);
+    const active = result.profileId ? llm.profiles.find((row) => row.id === result.profileId) : null;
     if (active) fillLlmForm(active);
+    else fillLlmForm(llmNewDraft, true);
     clearCost();
     setLlmStatus('Deleted the profile.');
     if (activeLlm()?.provider !== 'ollama' && leaseRequested && !job) release();
@@ -1154,8 +1264,10 @@ async function revealLlmKey() {
     setLlmStatus('Save the profile before revealing its key.', true);
     return;
   }
+  const id = llmEditingId;
   try {
-    const result = await worker('llm-reveal-key', { id: llmEditingId });
+    const result = await worker('llm-reveal-key', { id });
+    if (llmEditingId !== id || !dialog.open || settingsTab !== 'llm' || byId('llm-reveal').disabled) return;
     const value = byId('llm-key-value');
     value.textContent = result.key;
     value.hidden = false;
@@ -1172,8 +1284,10 @@ async function copyLlmKey() {
     setLlmStatus('Save the profile before copying its key.', true);
     return;
   }
+  const id = llmEditingId;
   try {
-    const result = await worker('llm-reveal-key', { id: llmEditingId });
+    const result = await worker('llm-reveal-key', { id });
+    if (llmEditingId !== id || !dialog.open || settingsTab !== 'llm' || byId('llm-copy').disabled) return;
     await navigator.clipboard.writeText(result.key);
     setLlmStatus('API key copied to the clipboard.');
   } catch (error) {
@@ -1199,22 +1313,17 @@ async function importFile(file) {
   if (!file || !state) return;
   const current = state;
   try {
+    if (file.size > YTCT.maxEntryBytes) throw new Error('Choose an export up to 8 MiB.');
     const text = await file.text();
     const stem = YTCT.sanitizeName(file.name.replace(/\.(md|markdown|json)$/i, ''), 180) || 'youtube-comments';
-    const entry = /\.json$/i.test(file.name)
+    const rawEntry = /\.json$/i.test(file.name)
       ? { stem, snapshot: JSON.parse(text.replace(/^\uFEFF/, '')) } : { stem, markdown: text };
-    if (state !== current) return;
-    await worker('mark-used', { key: current.key });
-    const result = await worker('write-cache', { key: current.key, entry });
-    if (state === current) {
-      adoptEntry(entry);
-      if (!result.saved) notice(result.reason);
-      closeSettings();
-    }
+    await receiveEntry(current, rawEntry);
+    if (state === current) closeSettings();
   } catch (error) { settingsError(error.message); }
 }
 
-// ---- Ask Gemma height ----
+// ---- Ask panel height ----
 const askSection = byId('ai');
 const askHandle = byId('ai-resize');
 const ASK_MIN = 110;
@@ -1267,6 +1376,10 @@ window.addEventListener('resize', () => setAskHeight(askHeight));
 byId('search-mode').addEventListener('click', () => setMode('search'));
 byId('ai-mode').addEventListener('click', () => setMode('ai'));
 byId('collect').addEventListener('click', () => collect());
+byId('download-export').addEventListener('click', downloadExport);
+byId('clear-chat').addEventListener('click', () => { approvedScopes.clear(); clearChat(); });
+byId('load-saved-export').addEventListener('click', loadSavedExport);
+byId('clear-cache').addEventListener('click', clearSavedExports);
 byId('collect-fresh').addEventListener('click', () => { closeSettings(); collect(true); });
 byId('open-settings').addEventListener('click', showSettings);
 byId('close-settings').addEventListener('click', closeSettings);
@@ -1311,6 +1424,22 @@ byId('settings-llm').addEventListener('change', () => { llmDirty = true; });
 byId('llm-provider').addEventListener('change', applyProviderChange);
 byId('llm-endpoint').addEventListener('input', () => {
   if (llmGrantOrigin && providerOrigin({ endpoint: byId('llm-endpoint').value }) !== llmGrantOrigin) hideGrant();
+  clearLlmKeyReveal();
+  if (byId('llm-key').value) {
+    byId('llm-key').value = '';
+    setLlmStatus('The endpoint changed. Re-enter the key for this destination.');
+  }
+  const saved = llm.profiles.find((row) => row.id === llmEditingId);
+  const endpoint = byId('llm-endpoint').value.trim();
+  let changed = true;
+  try { changed = canonicalEndpoint(endpoint) !== canonicalEndpoint(saved?.endpoint); } catch {}
+  if (saved?.hasKey && !llmProviderChanged) {
+    const keep = !changed && !llmKeyClear;
+    byId('llm-reveal').disabled = !keep;
+    byId('llm-copy').disabled = !keep;
+    byId('llm-key-mask').textContent = changed ? 'Enter a key for the new endpoint.' : 'Saved key ' + maskKey(saved.keyHint);
+    byId('llm-key').placeholder = keep ? 'Leave blank to keep ' + maskKey(saved.keyHint) : 'API key';
+  }
   llmDirty = true;
 });
 byId('llm-load-models').addEventListener('click', loadModels);
@@ -1322,14 +1451,11 @@ byId('llm-grant-button').addEventListener('click', () => {
   }).catch((error) => setLlmStatus('Could not open the permission tab: ' + error.message, true));
   setLlmStatus('Opened a permission tab. Grant access there, then return and test again.');
 });
-chrome.permissions.onAdded.addListener((permissions) => {
-  if (!llmGrantOrigin) return;
+chrome.permissions.onAdded.addListener(async () => {
   const origin = llmGrantOrigin;
-  const pattern = origin + '/*';
-  if (!permissions.origins?.includes(pattern)) return;
+  if (!origin || !await hasHostAccess(origin) || llmGrantOrigin !== origin) return;
   hideGrant();
-  setLlmStatus('Network access granted for ' + origin + '. Testing connection…');
-  if (dialog.open && settingsTab === 'llm') void testConnection();
+  setLlmStatus('Access granted for ' + origin + '. Choose Test to check the connection.');
 });
 byId('llm-profile-select').addEventListener('change', (event) => {
   if (!event.target.value) newLlmProfile();
@@ -1356,6 +1482,7 @@ byId('llm-clear-key').addEventListener('click', () => {
     return;
   }
   llmKeyClear = true;
+  clearLlmKeyReveal();
   byId('llm-key-mask').textContent = 'Key will be removed when saved';
   byId('llm-reveal').disabled = true;
   byId('llm-copy').disabled = true;
@@ -1385,13 +1512,13 @@ chrome.storage.onChanged.addListener((changes, area) => {
     viewer.setSettings(settings);
   }
   if (changes.llmConfig?.newValue) loadLlmConfig();
-  if (state && changes['export:' + state.key]?.newValue) adoptEntry(changes['export:' + state.key].newValue);
 });
 chrome.tabs.onUpdated.addListener((id, change) => { if (id === tabId && change.status === 'complete') connect(); });
 chrome.tabs.onRemoved.addListener((id) => { if (id === tabId) window.close(); });
 window.addEventListener('pagehide', () => {
   closing = true;
   clearLlmKeyReveal();
+  byId('llm-key').value = '';
   stopAsking();
   modelPort?.disconnect();
   port?.disconnect();

@@ -38,12 +38,16 @@
   const PAGE_TIMEOUT_MS = 30000;
   const DEADLINE_MINUTES = 90; // hard wall-clock guard for very large sections
   const MAX_CEILING = 25000; // absolute request ceiling, even if YouTube keeps yielding
+  const MAX_COMMENT_BYTES = 6 * 1024 * 1024;
+  const encoder = new TextEncoder();
 
   function createCollectionState() {
     return {
       running: false,
       aborted: false,
       comments: new Map(),
+      commentBytes: 0,
+      limitReached: false,
       queue: [],
       queuedKeys: new Set(),
       seenTokens: new Set(),
@@ -147,7 +151,8 @@
     try {
       const input = arguments[0];
       const url = typeof input === 'string' ? input : (input && input.url) || '';
-      if (/\/youtubei\/v1\/(browse|next)/.test(url)) {
+      const endpoint = url && new URL(url, location.href);
+      if (endpoint?.origin === location.origin && /^\/youtubei\/v1\/(browse|next)$/.test(endpoint.pathname)) {
         syncCollectionSource();
         const generation = sourceGeneration;
         promise.then(async (res) => {
@@ -202,17 +207,24 @@
       if (!p?.properties || (fromCapture && p.properties.replyLevel > 0)) continue;
       const cid = p.properties.commentId;
       if (!cid || state.comments.has(cid)) continue;
-      state.comments.set(cid, {
+      const comment = {
         id: cid,
         parent: parentId || null,
         author: String(p.author?.displayName || '').replace(/^@+/, '').trim(),
         authorChannelId: p.author?.channelId || '',
         avatar: p.author?.avatarThumbnailUrl || '',
-        text: p.properties.content?.content || '',
+        text: String(p.properties.content?.content || '').slice(0, 32768),
         published: p.properties.publishedTime || '',
         likes: p.toolbar?.likeCountNotliked || p.toolbar?.likeCountLiked || '0',
         replyCount: p.toolbar?.replyCount || '',
-      });
+      };
+      const bytes = encoder.encode(JSON.stringify(comment)).byteLength + 1;
+      if (state.comments.size >= 50000 || state.commentBytes + bytes > MAX_COMMENT_BYTES) {
+        state.limitReached = true;
+        break;
+      }
+      state.commentBytes += bytes;
+      state.comments.set(cid, comment);
       added++;
     }
     return added;
@@ -395,9 +407,11 @@
   }
 
   async function youtubePost(cfg, endpoint, payload, signal) {
-    const res = await nativeFetch('/youtubei/v1/' + endpoint + '?key=' + encodeURIComponent(cfg.key) + '&prettyPrint=false', {
+    const res = await nativeFetch(location.origin + '/youtubei/v1/' + endpoint +
+      '?key=' + encodeURIComponent(cfg.key) + '&prettyPrint=false', {
       method: 'POST',
       credentials: 'include',
+      redirect: 'error',
       signal,
       headers: { 'Content-Type': 'application/json', 'X-Youtube-Client-Name': '1', 'X-Youtube-Client-Version': cfg.version },
       body: JSON.stringify({ context: cfg.ctx, ...payload }),
@@ -501,6 +515,10 @@
   }
 
   async function collectComments(job) {
+    if (state.limitReached) {
+      state.result = { status: 'partial', reason: 'Comment export reached its size limit' };
+      return state.result;
+    }
     if (state.result.status === 'complete' && !state.queue.length) return state.result;
 
     const signal = job.controller.signal;
@@ -576,6 +594,10 @@
         if (added) state.lastGainAt = state.attempts;
         idle = added || emptyReply ? 0 : idle + 1;
         updateProgressUI();
+        if (state.limitReached) {
+          stopReason = 'Comment export reached its size limit';
+          break;
+        }
         if (idle > 15 && state.queue.length) {
           stopReason = 'no new comments in 16 consecutive pages';
           break;
@@ -611,7 +633,7 @@
       return { status: 'partial', reason: 'additional continuations are queued', pendingPages };
     }
     const status = result.status === 'running' || result.status === 'idle' ? 'partial' : result.status;
-    return { ...result, status, pendingPages };
+    return { ...result, status, pendingPages, limitReached: state.limitReached };
   }
 
   function counts() {
@@ -714,7 +736,7 @@
     const isVideo = /^\/watch/.test(location.pathname);
     const meta = {
       kind: isVideo ? 'video' : 'post',
-      url: location.href.split('&lc=')[0],
+      url: canonicalSource(),
       id: '',
       channel: getChannel(),
       channelId: '',
@@ -827,9 +849,15 @@
     metadataCache = null;
   }
 
+  function canonicalSource() {
+    const key = sourceKey();
+    return 'https://www.youtube.com/' + (key.startsWith('video:') ? 'watch?v=' : 'post/') +
+      encodeURIComponent(key.slice(key.indexOf(':') + 1));
+  }
+
   function exportData() {
     return {
-      source: location.href,
+      source: canonicalSource(),
       metadata: metadataForExport(),
       exportedAt: new Date().toISOString(),
       startedAt: state.startedAt?.toISOString() || null,
@@ -1056,8 +1084,10 @@
     }
   }
 
+  let bridgePort = null;
+
   function send(message) {
-    window.postMessage({ channel: 'ytct-page-result', ...message }, location.origin);
+    try { bridgePort?.postMessage(message); } catch {}
   }
 
   function updateProgressUI(force = false) {
@@ -1091,11 +1121,20 @@
     throw new Error('Unknown collector action.');
   }
 
-  window.addEventListener('message', (event) => {
-    const message = event.data;
-    if (event.source !== window || event.origin !== location.origin || message?.channel !== 'ytct-page-request' || typeof message.id !== 'string') return;
-    handle(message).then((value) => send({ id: message.id, key: message.key, value }),
-      (error) => send({ id: message.id, key: message.key, error: error.message || String(error) }));
-  });
+  function onBridgeInit(event) {
+    if (event.source !== window || event.origin !== location.origin || event.data?.channel !== 'ytct-page-init') return;
+    const port = event.ports?.[0];
+    if (!(port instanceof MessagePort)) return;
+    window.removeEventListener('message', onBridgeInit);
+    bridgePort = port;
+    bridgePort.onmessage = ({ data: message }) => {
+      if (!message || typeof message.id !== 'string') return;
+      handle(message).then((value) => send({ id: message.id, key: message.key, value }),
+        (error) => send({ id: message.id, key: message.key, error: String(error?.message || error).slice(0, 512) }));
+    };
+    bridgePort.postMessage({ event: 'ready' });
+  }
+  window.addEventListener('message', onBridgeInit);
+  window.postMessage({ channel: 'ytct-page-ready' }, location.origin);
   for (const event of ['yt-navigate-finish', 'yt-page-data-updated']) document.addEventListener(event, syncCollectionSource);
 })();

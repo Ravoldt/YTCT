@@ -1,22 +1,57 @@
 import { relayPanelChat, relayResponse } from './loopback-stream.mjs';
 
-export const DEFAULT_MODEL = 'gemma4:12b';
 const base = 'http://127.0.0.1:11434';
 const keepAlive = '5m';
+
+export function modelName(model) {
+  const value = String(model || '').trim();
+  if (!value) return '';
+  return value.slice(value.lastIndexOf('/') + 1).includes(':') ? value : value + ':latest';
+}
+
+async function boundedText(response, maxBytes = 1024 * 1024) {
+  if (!response.body) return response.text();
+  const reader = response.body.getReader();
+  const chunks = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) throw new Error('Ollama response exceeded the size limit.');
+      chunks.push(value);
+    }
+  } finally {
+    await reader.cancel().catch(() => {});
+    reader.releaseLock();
+  }
+  const merged = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    merged.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(merged);
+}
+
+async function boundedJson(response, maxBytes = 1024 * 1024) {
+  return JSON.parse(await boundedText(response, maxBytes));
+}
 
 async function request(path, payload, signal, relay = relayPanelChat) {
   let response;
   try {
     response = payload
       ? await relayResponse((receive) => relay(path, payload, receive), signal)
-      : await fetch(base + path, { signal });
+      : await fetch(base + path, { signal, credentials: 'omit', redirect: 'error' });
   } catch (error) {
     signal?.throwIfAborted();
     if (payload) throw error;
     throw new Error('Could not reach Ollama on port 11434. Start Ollama and try again.', { cause: error });
   }
   if (!response.ok) {
-    const text = await response.text();
+    const text = await boundedText(response, 65536).catch(() => '');
     let reason = text;
     try { reason = JSON.parse(text).error || text; } catch {}
     throw new Error('Ollama HTTP ' + response.status + ' · ' + reason.slice(0, 400));
@@ -24,25 +59,19 @@ async function request(path, payload, signal, relay = relayPanelChat) {
   return response;
 }
 
-export async function loadedModel(model = DEFAULT_MODEL) {
+export async function loadedModel(model) {
+  const target = modelName(model);
+  if (!target) return null;
   const response = await request('/api/ps', null, AbortSignal.timeout(7000));
-  const { models } = await response.json();
-  return models?.find((entry) => entry.name === model || entry.model === model) || null;
+  const { models } = await boundedJson(response, 1024 * 1024);
+  return models?.find((entry) => [entry.name, entry.model].some((name) =>
+    typeof name === 'string' && modelName(name) === target)) || null;
 }
 
-export async function unloadModel(model = DEFAULT_MODEL, relay) {
+export async function unloadModel(model, relay) {
+  if (!model) return;
   const response = await request('/api/generate', { model, keep_alive: 0, stream: false }, AbortSignal.timeout(15000), relay);
-  await response.json();
-}
-
-export async function availableVram() {
-  try {
-    const response = await fetch('http://127.0.0.1:11435/vram', { signal: AbortSignal.timeout(3500) });
-    if (!response.ok) return null;
-    const { gpus } = await response.json();
-    const usable = (gpus || []).filter((gpu) => Number.isFinite(gpu?.free_mib));
-    return usable.sort((a, b) => b.free_mib - a.free_mib)[0] || null;
-  } catch { return null; }
+  await boundedJson(response, 65536);
 }
 
 export async function readChatStream(response, update, signal) {
@@ -57,7 +86,10 @@ export async function readChatStream(response, update, signal) {
     const data = JSON.parse(line);
     if (data.error) throw new Error(data.error);
     if (data.message?.thinking) thinking = true;
-    if (data.message?.content) content += data.message.content;
+    if (typeof data.message?.content === 'string') {
+      content += data.message.content;
+      if (content.length > 262144) throw new Error('The local model answer exceeded the display limit.');
+    }
     if (data.done === true) metrics = data;
   }
   try {
@@ -67,6 +99,7 @@ export async function readChatStream(response, update, signal) {
       buffer += value || '';
       const lines = buffer.split('\n');
       buffer = lines.pop();
+      if (buffer.length > 512 * 1024) throw new Error('Ollama returned an oversized stream event.');
       const before = content.length;
       const wasThinking = thinking;
       for (const line of lines) {
@@ -87,8 +120,9 @@ export async function readChatStream(response, update, signal) {
 }
 
 export async function askOllama(session, history, question, settings, onChange, signal, {
-  model = DEFAULT_MODEL, thinking = 'default',
+  model = '', thinking = 'default',
 } = {}) {
+  if (!model) throw new Error('Select an Ollama model in Settings → LLM.');
   let budgetScale = 1;
   let think = thinking === 'default' ? undefined : thinking === 'off' ? false : thinking;
   let triedThinkFallback = false;

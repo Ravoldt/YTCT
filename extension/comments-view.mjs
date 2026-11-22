@@ -77,7 +77,8 @@ function button(label, style, action) {
 function safeAvatar(raw) {
   try {
     const url = new URL(raw);
-    if (url.protocol === 'https:' && ['yt3.ggpht.com', 'yt3.googleusercontent.com'].includes(url.hostname)) return url.href;
+    if (url.protocol === 'https:' && !url.port && !url.username && !url.password
+      && ['yt3.ggpht.com', 'yt3.googleusercontent.com'].includes(url.hostname)) return url.href;
   } catch {}
   return '';
 }
@@ -487,9 +488,9 @@ export class CommentsView {
     const avatarUrl = safeAvatar(record.avatar);
     if (avatarUrl) {
       const image = document.createElement('img');
+      image.referrerPolicy = 'no-referrer';
       image.alt = '';
       image.loading = 'lazy';
-      image.referrerPolicy = 'no-referrer';
       image.src = avatarUrl;
       image.addEventListener('error', () => image.remove(), { once: true });
       avatar.append(image);

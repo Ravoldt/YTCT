@@ -2,9 +2,10 @@
 
 // Export formats, timestamps, and prompt budgeting shared by the extension contexts.
 globalThis.YTCT = (() => {
+  const maxEntryBytes = 8 * 1024 * 1024;
 
   const settingsDefaults = Object.freeze({
-    format: 'markdown', includeTranscript: true, contextWindow: 32768, debugOllama: false,
+    format: 'markdown', shareTranscript: false, contextWindow: 32768, debugOllama: false, cacheEnabled: false,
     cacheDays: 7, cacheMB: 100, unusedCacheHours: 24, highlightOffset: -3, replyBatch: 10, allReplies: false,
     fontScale: 100, highlightDuration: 6, stackWindow: 3,
   });
@@ -15,8 +16,8 @@ globalThis.YTCT = (() => {
       if (parsed.origin !== 'https://www.youtube.com') return '';
       const video = parsed.pathname === '/watch' && parsed.searchParams.get('v');
       const post = /\/post\/([^/]+)/.exec(parsed.pathname);
-      if (video) return 'video:' + video;
-      if (post) return 'post:' + post[1];
+      if (/^[\w-]{1,80}$/.test(video || '')) return 'video:' + video;
+      if (/^[\w-]{1,100}$/.test(post?.[1] || '')) return 'post:' + post[1];
       return parsed.pathname;
     } catch (e) {
       return '';
@@ -137,10 +138,13 @@ globalThis.YTCT = (() => {
   // ------------------------------------------------------------------ naming
   function sanitizeName(s, maxLen) {
     const out = String(s || '')
-      .replace(/[\\/:*?"<>|\r\n\t]+/g, ' ')
+      .replace(/[\x00-\x1f\x7f\u200e\u200f\u202a-\u202e\u2066-\u2069]+/g, '')
+      .replace(/[\\/:*?"<>|]+/g, ' ')
       .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/^\.+|\.+$/g, '')
       .trim();
-    return maxLen ? out.slice(0, maxLen).trim() : out;
+    return maxLen ? out.slice(0, maxLen).replace(/\.+$/g, '').trim() : out;
   }
 
   // {channel} {title} {YYYY-MM-DD HH-mm-ss}.{ext} — timestamp is collection start.
@@ -301,7 +305,7 @@ globalThis.YTCT = (() => {
       const marker = /^(?: {0,3})(\x60{3,}|~{3,})/.exec(line)?.[1];
       if (marker && (!fence || marker.startsWith(fence))) fence = fence ? '' : marker;
       const heading = !fence && /^## @(.+?) — (.+)$/.exec(line);
-      const reply = !fence && replies && /^- \*\*@(.+?)\*\*(.*?)\s*:\s?(.*)$/.exec(line);
+      const reply = !fence && replies && /^- \*\*@(.+?)\*\*([^:\r\n]*):\s?(.*)$/.exec(line);
       if (heading || reply) {
         flush();
         const [, author, suffix, text] = heading || reply;
@@ -382,7 +386,7 @@ globalThis.YTCT = (() => {
     const { messages, remaining, trimmed } = fitFollowUp(history, question, session.contextWindow, budgetScale);
     const entry = session.entry;
     const meta = session.meta;
-    const transcript = settings.includeTranscript ? entry.transcript : null;
+    const transcript = settings.shareTranscript ? entry.transcript : null;
     const captionRows = transcript?.ok ? transcript.text.split('\n').map((text) => ({ text, cost: estimatedTokens(text) + 1 })) : [];
     const system = AI_SYSTEM_PROMPT;
     const source = [
@@ -413,8 +417,9 @@ globalThis.YTCT = (() => {
       captions.rows.length ? '## Video transcript\n' + captions.rows.map((row) => row.text).join('\n') : '',
       transcriptTruncated ? '[Some transcript blocks were omitted to fit the context window.]' : '',
     ].filter(Boolean).join('\n\n');
-    messages[0] = { ...messages[0], content: material + '\n\n## User question\n' + messages[0].content };
-    if (images.length) messages[0].images = images;
+    const current = messages.length - 1;
+    messages[current] = { ...messages[current], content: material + '\n\n## User question\n' + question };
+    if (images.length) messages[current].images = images;
     messages.unshift({ role: 'system', content: system });
     return {
       messages, trimmed, truncated, transcriptTruncated, transcriptIncluded: captions.rows.length,
@@ -442,5 +447,5 @@ globalThis.YTCT = (() => {
   return Object.freeze({ settingsDefaults, sourceKey, isMediaSource, sourceLink, formatDuration, parseLikes,
     buildMarkdown, buildJson, sanitizeName, stamp, markdownSourceKey, parseTimestampToSeconds, TIMESTAMP_PATTERN,
     commentTimestamps, sidebarPreview, timelineFor, activeTimestamp, commentsFromExport, commentRows,
-    buildAiContext, citationLinks, outputTokenBudget });
+    buildAiContext, citationLinks, outputTokenBudget, estimatedTokens, maxEntryBytes });
 })();

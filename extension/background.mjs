@@ -1,6 +1,8 @@
 import './common.js';
-import { DEFAULT_MODEL, loadedModel, unloadModel } from './ollama.mjs';
-import { connectLoopback, relayLoopback } from './loopback-worker.mjs';
+import { loadedModel, modelName, unloadModel } from './ollama.mjs';
+import { connectLoopback, hasOllamaAccess, relayLoopback, teardownLoopback } from './loopback-worker.mjs';
+import { connectOffscreen, saveDownload } from './offscreen-worker.mjs';
+import { normalizeEntry } from './export-entry.mjs';
 import {
   activateLlmProfile, activeOllamaModel, connectLlmChat, deleteLlmProfile,
   getLlmConfig, listLlmModels, revealLlmKey, saveLlmProfile, testLlmConnection,
@@ -13,8 +15,11 @@ const panelPath = (tabId) => 'sidepanel.html?tab=' + tabId;
 const youtube = 'https://www.youtube.com';
 
 // API keys and profile data are only available to extension contexts, never to content scripts or pages.
-try { chrome.storage.local.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' }); } catch {}
-try { chrome.storage.session.setAccessLevel?.({ accessLevel: 'TRUSTED_CONTEXTS' }); } catch {}
+const protectStorage = Promise.all([
+  chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
+  chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }),
+]);
+protectStorage.catch(() => {});
 
 let cacheQueue = Promise.resolve();
 let modelQueue = Promise.resolve();
@@ -34,6 +39,7 @@ function modelTask(action) {
 
 function tabFromPanel(sender) {
   try {
+    if (sender.id !== chrome.runtime.id || sender.tab) return null;
     const url = new URL(sender.url);
     if (url.origin !== new URL(chrome.runtime.getURL('')).origin || url.pathname !== '/sidepanel.html') return null;
     const tabId = Number(url.searchParams.get('tab'));
@@ -49,7 +55,8 @@ async function panelDocument(sender) {
 
 function tabFromContent(sender) {
   try {
-    return sender.frameId === 0 && new URL(sender.url).origin === youtube && sender.tab?.id > 0 ? sender.tab.id : null;
+    return sender.id === chrome.runtime.id && sender.frameId === 0 && !sender.tab?.incognito
+      && new URL(sender.url).origin === youtube && sender.tab?.id > 0 ? sender.tab.id : null;
   } catch { return null; }
 }
 
@@ -66,7 +73,8 @@ function normalizeSettings(raw = {}) {
   const s = { ...settingsDefaults, ...raw };
   return {
     format: s.format === 'json' ? 'json' : 'markdown',
-    includeTranscript: !!s.includeTranscript,
+    shareTranscript: s.shareTranscript === true,
+    cacheEnabled: s.cacheEnabled === true,
     debugOllama: !!s.debugOllama,
     contextWindow: bounded(s.contextWindow, 32768, 1024, 262144),
     highlightOffset: bounded(s.highlightOffset, -3, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
@@ -116,6 +124,12 @@ async function persistCache(index, removed, values = {}) {
   if (removed.length) await chrome.storage.local.remove(removed);
 }
 
+async function removeOrphanedExports(index) {
+  const keys = (await chrome.storage.local.getKeys()).filter((key) =>
+    key.startsWith('export:') && !Object.hasOwn(index, key.slice(7)));
+  if (keys.length) await chrome.storage.local.remove(keys);
+}
+
 async function setVisit(tabId, key, pageId = '') {
   const { index, settings, visits } = await cacheState();
   const prior = visits[tabId];
@@ -128,17 +142,6 @@ async function setVisit(tabId, key, pageId = '') {
   await chrome.storage.session.set({ visits });
   if (prior && (prior.pageId !== pageId || prior.key !== key)) await chrome.storage.session.remove('chat:' + tabId);
   await persistCache(index, removed);
-  return { saved: index[key] || null, settings };
-}
-
-function verifyEntry(key, entry) {
-  if (entry?.snapshot) {
-    const data = entry.snapshot;
-    return sourceKey(data.source) === key && Array.isArray(data.comments) && data.comments.length > 0
-      && data.comments.every((comment) => typeof comment?.id === 'string' && typeof comment?.text === 'string')
-      && !!data.metadata && !!data.collection && Array.isArray(data.stats?.errors);
-  }
-  return typeof entry?.markdown === 'string' && YTCT.markdownSourceKey(entry.markdown) === key;
 }
 
 async function cacheAction(message, tabId) {
@@ -155,29 +158,42 @@ async function cacheAction(message, tabId) {
     if (common.removed.length) await persistCache(index, common.removed);
     return { settings, bytes: common.bytes, limit: common.limit };
   }
-  if (visits[tabId]?.key !== key) throw new Error('The YouTube source changed. Reopen the side panel.');
+  if (message.type === 'clear-cache') {
+    await removeOrphanedExports({});
+    await persistCache({}, []);
+    return;
+  }
+  if (!isMediaSource(key) || visits[tabId]?.key !== key || visits[tabId].pageId !== message.pageId) {
+    throw new Error('The YouTube source changed. Reopen the side panel.');
+  }
   if (message.type === 'read-cache') {
     if (common.removed.length) await persistCache(index, common.removed);
-    return index[key] ? (await chrome.storage.local.get(entryKey(key)))[entryKey(key)] || null : null;
+    if (!index[key] || (!message.explicit && (!settings.cacheEnabled || index[key].pageId !== message.pageId))) return null;
+    const entry = (await chrome.storage.local.get(entryKey(key)))[entryKey(key)];
+    return entry ? normalizeEntry(key, entry) : null;
   }
   if (message.type === 'mark-used') {
     visits[tabId].used = true;
-    if (index[key]) index[key].used = true;
+    if (index[key]?.pageId === message.pageId || message.explicit && index[key]) index[key].used = true;
     await chrome.storage.session.set({ visits });
     await persistCache(index, common.removed);
     return;
   }
-  const entry = message.entry;
-  if (!verifyEntry(key, entry)) throw new Error('Choose a matching YouTube comment export.');
+  if (message.type !== 'write-cache') throw new Error('Unknown extension action.');
+  const entry = normalizeEntry(key, message.entry);
+  if (!settings.cacheEnabled) {
+    if (common.removed.length) await persistCache(index, common.removed);
+    return { saved: false };
+  }
   const bytes = new Blob([JSON.stringify(entry)]).size;
   if (bytes > common.limit) {
     if (common.removed.length) await persistCache(index, common.removed);
     return { saved: false, reason: 'This export exceeds the cache limit. Increase it in Settings to keep this export.' };
   }
-  const prior = index[key];
   index[key] = {
-    savedAt: message.keepAge && prior ? prior.savedAt : Date.now(),
-    used: !!prior?.used || Object.values(visits).some((visit) => visit.key === key && visit.used),
+    savedAt: Date.now(),
+    pageId: message.pageId,
+    used: visits[tabId].used,
     bytes,
     status: entry.snapshot?.collection?.status || 'imported',
   };
@@ -187,30 +203,47 @@ async function cacheAction(message, tabId) {
 }
 
 async function reconcileModel({ acquire, release, tabId } = {}) {
-  const state = await sessionValue('model', { owned: false, leases: {}, model: '' });
+  const state = await sessionValue('model', { leases: {}, ownedModels: [] });
+  state.ownedModels ??= state.owned && state.model ? [modelName(state.model)] : [];
+  for (const lease of Object.values(state.leases)) lease.model = modelName(lease.model || state.model || '');
   const live = new Set((await chrome.runtime.getContexts({})).map((context) => context.documentId));
   for (const [document, lease] of Object.entries(state.leases)) {
-    if (document === release || (tabId && lease.tabId === tabId) || !live.has(document)) {
+    if (document === release || (tabId && lease.tabId === tabId) || !live.has(document)
+      || (document === acquire?.document && lease.model !== acquire.model)) {
       activeChats.get(document)?.();
       delete state.leases[document];
     }
   }
+  let result;
   if (acquire) {
     if (!live.has(acquire.document)) throw new Error('The side panel has closed.');
-    const model = await activeOllamaModel();
-    const resident = model ? await loadedModel(model) : null;
-    if (!Object.keys(state.leases).length && !resident && model) state.owned = true;
-    if (model) state.model = model;
-    state.leases[acquire.document] = { tabId: acquire.tabId };
-    await chrome.storage.session.set({ model: state });
-    return { resident, owned: state.owned, model: model || '' };
+    if (!await hasOllamaAccess()) {
+      const error = new Error('Host access is missing for http://127.0.0.1:11434. Open “Grant network access” in Settings → LLM, then try again.');
+      error.code = 'HOST_ACCESS';
+      throw error;
+    }
+    const { model } = acquire;
+    const resident = await loadedModel(model);
+    if (!resident && !state.ownedModels.includes(model)) state.ownedModels.push(model);
+    state.leases[acquire.document] = { tabId: acquire.tabId, model };
+    result = { resident, model };
   }
-  if (!Object.keys(state.leases).length && state.owned) {
-    await chrome.storage.session.set({ model: state });
-    await unloadModel(state.model || DEFAULT_MODEL, relayLoopback);
-    state.owned = false;
-  }
+  delete state.owned;
+  delete state.model;
   await chrome.storage.session.set({ model: state });
+  if (state.ownedModels.length && await hasOllamaAccess()) {
+    for (const model of [...state.ownedModels]) {
+      if (Object.values(state.leases).some((lease) => lease.model === model)) continue;
+      try {
+        if (await loadedModel(model)) await unloadModel(model, relayLoopback);
+        state.ownedModels = state.ownedModels.filter((name) => name !== model);
+      } catch {
+        // Maintenance will retry a failed unload.
+      }
+    }
+    await chrome.storage.session.set({ model: state });
+  }
+  return result;
 }
 
 function releaseTab(tabId) {
@@ -222,24 +255,44 @@ async function handle(message, sender) {
   const panelTab = tabFromPanel(sender);
   const tabId = contentTab || panelTab;
   if (!tabId) throw new Error('Unsupported extension context.');
+  await protectStorage;
   switch (message.type) {
     case 'visit': {
-      if (!contentTab || typeof message.pageId !== 'string') throw new Error('Unsupported visit.');
-      // sender.url keeps the URL the content script was injected into, so it is stale after
-      // YouTube's SPA navigations. The content script's own href is current.
-      const href = typeof message.href === 'string' && message.href ? message.href : sender.tab?.url || sender.url;
-      const key = sourceKey(href);
-      if (!key || message.key !== key) throw new Error('The page changed.');
-      await chrome.sidePanel.setOptions({ tabId, path: panelPath(tabId), enabled: isMediaSource(message.key) });
-      return cacheTask(() => setVisit(tabId, message.key, message.pageId));
+      if (!contentTab || typeof message.pageId !== 'string' || message.pageId.length > 80) throw new Error('Unsupported visit.');
+      return cacheTask(async () => {
+        const tab = await chrome.tabs.get(tabId);
+        const key = sourceKey(tab.url || sender.url);
+        if (!key || tab.incognito || message.key !== key) throw new Error('The page changed.');
+        await chrome.sidePanel.setOptions({ tabId, path: panelPath(tabId), enabled: isMediaSource(key) });
+        await setVisit(tabId, key, message.pageId);
+        return true;
+      });
     }
     case 'read-cache':
     case 'mark-used':
     case 'write-cache':
+    case 'clear-cache':
+      if (!panelTab) throw new Error('Open the side panel to manage exports.');
       return cacheTask(() => cacheAction(message, tabId));
     case 'settings':
-      if (!panelTab && message.values) throw new Error('Open the side panel to change settings.');
+      if (!panelTab) throw new Error('Open the side panel to manage settings.');
       return cacheTask(() => cacheAction(message, tabId));
+    case 'download-cache':
+    case 'download-export': {
+      const { entry, format } = await cacheTask(async () => {
+        const { key, pageId } = message;
+        const { visits, settings } = await cacheState();
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.incognito || sourceKey(tab.url) !== key || visits[tabId]?.key !== key || visits[tabId].pageId !== pageId) {
+          throw new Error('The YouTube source changed.');
+        }
+        const entry = message.type === 'download-cache' ? await cacheAction({ ...message, type: 'read-cache', explicit: false }, tabId)
+          : normalizeEntry(key, message.entry);
+        return { entry, format: settings.format };
+      });
+      if (!entry || (message.type === 'download-cache' && format === 'json' && !entry.snapshot)) return false;
+      return saveDownload(entry, format);
+    }
     case 'close-panel':
       if (!panelTab) throw new Error('Open the side panel first.');
       if (typeof chrome.sidePanel.close === 'function') {
@@ -278,9 +331,9 @@ async function handle(message, sender) {
       return modelTask(async () => {
         const document = await panelDocument(sender);
         if (!document) throw new Error('Open the assistant panel in the side panel.');
-        return message.type === 'model-acquire'
-          ? reconcileModel({ acquire: { document, tabId } })
-          : reconcileModel({ release: document });
+        if (message.type === 'model-release') return reconcileModel({ release: document });
+        const model = modelName(await activeOllamaModel(message.profileId, message.destination));
+        return reconcileModel({ acquire: { document, tabId, model } });
       });
     default:
       throw new Error('Unknown extension action.');
@@ -294,14 +347,53 @@ chrome.runtime.onMessage.addListener((message, sender, reply) => {
       (error) => reply({ ok: false, error: error.message }));
     return true;
   }
-  if (!message?.type || message.type === 'ytct-loopback-wake') return false;
+  if (!message?.type || ['ytct-loopback-wake', 'ytct-loopback-close', 'ytct-offscreen-wake'].includes(message.type)) return false;
   handle(message, sender).then((value) => reply({ ok: true, value }),
-    (error) => reply({ ok: false, error: error.message || String(error) }));
+    (error) => reply({ ok: false, error: error.message || String(error), code: error.code, status: error.status }));
   return true;
 });
 
+function sanitizeOllamaPayload(payload, leasedModel) {
+  if (!payload || typeof payload !== 'object' || typeof payload.model !== 'string' || modelName(payload.model) !== leasedModel
+    || !Array.isArray(payload.messages) || !payload.messages.length || payload.messages.length > 200) {
+    return null;
+  }
+  const messages = [];
+  for (const item of payload.messages) {
+    if (!item || !['system', 'user', 'assistant'].includes(item.role) || typeof item.content !== 'string') return null;
+    const clean = { role: item.role, content: item.content };
+    if (item.images !== undefined) {
+      if (!Array.isArray(item.images) || item.images.length > 4
+        || item.images.some((img) => typeof img !== 'string' || img.length > 7 * 1024 * 1024)) return null;
+      clean.images = item.images;
+    }
+    messages.push(clean);
+  }
+  const result = {
+    model: payload.model,
+    messages,
+    stream: true,
+    keep_alive: '5m',
+    truncate: false,
+    shift: false,
+  };
+  if (typeof payload.think === 'boolean' || ['low', 'medium', 'high'].includes(payload.think)) {
+    result.think = payload.think;
+  }
+  if (payload.options && typeof payload.options === 'object') {
+    result.options = {
+      num_ctx: bounded(payload.options.num_ctx, 32768, 1024, 262144),
+      num_predict: bounded(payload.options.num_predict, 4096, 1, 8192),
+    };
+  }
+  return new Blob([JSON.stringify(result)]).size <= 18 * 1024 * 1024 ? result : null;
+}
+
 function connectChat(port) {
-  if (!tabFromPanel(port.sender)) return;
+  if (!tabFromPanel(port.sender)) {
+    try { port.disconnect(); } catch {}
+    return;
+  }
   const document = panelDocument(port.sender).catch(() => null);
   let documentId;
   let connected = true;
@@ -324,31 +416,41 @@ function connectChat(port) {
     started = true;
     modelTask(async () => {
       documentId = await document;
-      const state = await sessionValue('model', { leases: {}, model: '' });
+      const state = await sessionValue('model', { leases: {} });
       if (!connected) return;
-      const leasedModel = state.model || DEFAULT_MODEL;
-      if (!state.leases[documentId] || payload?.model !== leasedModel || !Array.isArray(payload.messages)) {
+      const leasedModel = state.leases[documentId]?.model;
+      const cleanPayload = leasedModel ? sanitizeOllamaPayload(payload, leasedModel) : null;
+      if (!cleanPayload) {
         throw new Error('Start a question from the side panel to connect to Ollama.');
       }
       activeChats.get(documentId)?.();
       activeChats.set(documentId, finish);
-      cancel = relayLoopback('/api/chat', payload, receive);
+      cancel = relayLoopback('/api/chat', cleanPayload, receive);
     }).catch((error) => receive({ type: 'error', error: error.message }));
   });
 }
 
 chrome.runtime.onConnect.addListener((port) => {
+  if (port.name === 'ytct-offscreen') { connectOffscreen(port); return; }
   if (port.name === 'ytct-loopback') { connectLoopback(port); return; }
   if (port.name === 'ytct-ollama-chat') { connectChat(port); return; }
   if (port.name === 'ytct-llm-chat') {
     if (tabFromPanel(port.sender)) connectLlmChat(port);
+    else try { port.disconnect(); } catch {}
     return;
   }
-  if (port.name !== 'ytct-model' || !tabFromPanel(port.sender)) return;
+  if (port.name !== 'ytct-model' || !tabFromPanel(port.sender)) {
+    try { port.disconnect(); } catch {}
+    return;
+  }
   const document = panelDocument(port.sender).catch(() => null);
   port.onDisconnect.addListener(() => {
     document.then((release) => release && modelTask(() => reconcileModel({ release }))).catch(() => {});
   });
+});
+
+chrome.permissions.onRemoved.addListener(() => {
+  teardownLoopback().catch(() => {});
 });
 
 chrome.sidePanel.onClosed.addListener(({ tabId }) => { if (tabId) releaseTab(tabId); });
@@ -371,6 +473,7 @@ chrome.tabs.onUpdated.addListener((tabId, change, tab) => {
 chrome.runtime.onInstalled.addListener(() => {
   chrome.sidePanel.setOptions({ enabled: false }).catch(() => {});
   chrome.storage.local.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }).catch(() => {});
+  chrome.storage.session.setAccessLevel({ accessLevel: 'TRUSTED_CONTEXTS' }).catch(() => {});
   chrome.alarms.create('maintenance', { periodInMinutes: 30 });
 });
 chrome.runtime.onStartup.addListener(() => chrome.alarms.create('maintenance', { periodInMinutes: 30 }));
@@ -380,6 +483,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     const { index, settings, visits } = await cacheState();
     const { removed } = prune(index, settings, visits);
     if (removed.length) await persistCache(index, removed);
+    await removeOrphanedExports(index);
   }).catch(() => {});
   modelTask(() => reconcileModel()).catch(() => {});
 });

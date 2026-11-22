@@ -2,7 +2,7 @@
 //
 // The preset-driven connection flow and parts of the provider catalog are adapted from
 // Cline (https://github.com/cline/cline), Copyright Cline Bot Inc., licensed under the
-// Apache License, Version 2.0. See LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md.
+// Apache License, Version 2.0. See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md.
 // Changes for this extension: trimmed provider set, Chrome MV3 host-permission flow,
 // local Ollama loopback, profile/key storage, and UI-specific defaults.
 
@@ -162,13 +162,13 @@ export const PROVIDERS = Object.freeze({
   }),
   ollama: preset('ollama', 'Ollama (local)', {
     defaultEndpoint: 'http://127.0.0.1:11434',
-    defaultModel: 'gemma4:12b',
+    defaultModel: '',
     chatPath: '/api/chat',
     modelsPath: '/api/tags',
     keyRequired: false,
     local: true,
     native: true,
-    help: 'Uses Ollama’s native chat API through the extension’s loopback. No key is needed.',
+    help: 'Uses Ollama’s native chat API through the extension’s loopback. No key is needed; host access is granted separately.',
   }),
   openwebui: preset('openwebui', 'Open WebUI (local)', {
     defaultEndpoint: 'http://localhost:3000',
@@ -219,23 +219,27 @@ export const PROVIDER_GROUPS = Object.freeze([
 ]);
 
 export const THINKING_LEVELS = Object.freeze(['default', 'off', 'low', 'medium', 'high']);
-export const DEFAULT_PROFILE_ID = 'local-gemma';
 
 const text = (value, limit) => String(value ?? '').trim().slice(0, limit);
 const number = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
 };
+const FORBIDDEN_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+const safeId = (value) => {
+  const candidate = text(value, 80);
+  return /^[A-Za-z0-9_-]{1,80}$/.test(candidate) && !FORBIDDEN_IDS.has(candidate) ? candidate : '';
+};
 
 export function providerSpec(provider) {
   return PROVIDERS[provider] || PROVIDERS.cloud;
 }
 
-export function defaultProfile(provider = 'ollama') {
+export function defaultProfile(provider = 'cloud') {
   const spec = providerSpec(provider);
   return {
-    id: provider === 'ollama' ? DEFAULT_PROFILE_ID : (globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now()),
-    label: provider === 'ollama' ? 'Local Gemma' : spec.label,
+    id: globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now(),
+    label: spec.label,
     name: '',
     provider: PROVIDERS[provider] ? provider : 'cloud',
     endpoint: spec.defaultEndpoint,
@@ -249,16 +253,15 @@ export function defaultProfile(provider = 'ollama') {
 }
 
 export function defaultLlmConfig() {
-  const profile = defaultProfile('ollama');
-  return { version: 1, activeProfileId: profile.id, profiles: [profile] };
+  return { version: 1, activeProfileId: '', profiles: [] };
 }
 
 export function normalizeProfile(raw, index = 0) {
-  const provider = raw && Object.hasOwn(PROVIDERS, raw.provider) ? raw.provider : 'ollama';
+  const provider = raw && Object.hasOwn(PROVIDERS, raw.provider) ? raw.provider : 'cloud';
   const spec = PROVIDERS[provider];
   return {
-    id: text(raw?.id, 80) || (globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now() + '-' + index),
-    label: text(raw?.label, 60) || (provider === 'ollama' ? 'Local Gemma' : spec.label),
+    id: safeId(raw?.id) || (globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now() + '-' + index),
+    label: text(raw?.label, 60) || spec.label,
     name: text(raw?.name, 32),
     provider,
     endpoint: provider === 'ollama' ? spec.defaultEndpoint : (text(raw?.endpoint, 400) || spec.defaultEndpoint),
@@ -275,9 +278,10 @@ export function normalizeLlmConfig(raw) {
   const source = raw && typeof raw === 'object' ? raw : defaultLlmConfig();
   const profiles = Array.isArray(source.profiles) && source.profiles.length
     ? source.profiles.slice(0, 50).map(normalizeProfile)
-    : [defaultProfile('ollama')];
-  let activeProfileId = text(source.activeProfileId, 80);
-  if (!profiles.some((profile) => profile.id === activeProfileId)) activeProfileId = profiles[0].id;
+    : [];
+  let activeProfileId = safeId(source.activeProfileId);
+  if (!profiles.length) activeProfileId = '';
+  else if (!profiles.some((profile) => profile.id === activeProfileId)) activeProfileId = profiles[0].id;
   return { version: 1, activeProfileId, profiles };
 }
 
@@ -309,13 +313,44 @@ export function providerModelChoices(profile) {
   return [...(providerSpecFor(profile).models || [])];
 }
 
-export function trimBase(endpoint) {
-  return String(endpoint || '').trim().replace(/\/+$/, '');
+export function isLoopback(url) {
+  return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+}
+
+export function endpointUrl(endpoint) {
+  let url;
+  try { url = new URL(endpoint); } catch { throw new Error('Enter a valid provider base URL.'); }
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopback(url))) {
+    throw new Error('Use HTTPS for provider endpoints. HTTP is allowed on loopback only.');
+  }
+  if (url.username || url.password || url.search || url.hash) {
+    throw new Error('Enter a base URL without credentials, query parameters, or a fragment.');
+  }
+  return url;
+}
+
+export function canonicalEndpoint(endpoint) {
+  const url = endpointUrl(endpoint);
+  return url.origin + url.pathname.replace(/\/+$/, '');
+}
+
+export function profileDestination(profile) {
+  return JSON.stringify([profile.id, profile.provider, canonicalEndpoint(profile.endpoint), profile.model]);
+}
+
+function trimBase(endpoint) {
+  try { return canonicalEndpoint(endpoint); } catch { return ''; }
+}
+
+function resolvedBase(profile, spec) {
+  const raw = text(profile?.endpoint, 400);
+  if (raw) return trimBase(raw);
+  return spec.defaultEndpoint;
 }
 
 export function chatEndpoint(profile) {
   const spec = providerSpecFor(profile);
-  const base = trimBase(profile?.endpoint) || spec.defaultEndpoint;
+  const base = resolvedBase(profile, spec);
   if (!base) return '';
   if (/\/chat\/completions$/i.test(base) || /\/api\/chat$/i.test(base)) return base;
   if (profile?.provider === 'openwebui') {
@@ -331,9 +366,11 @@ export function chatEndpoint(profile) {
 
 export function modelsEndpoint(profile) {
   const spec = providerSpecFor(profile);
-  const base = trimBase(profile?.endpoint) || spec.defaultEndpoint;
+  const base = resolvedBase(profile, spec);
   if (!base) return '';
   if (/\/models$/i.test(base) || /\/api\/tags$/i.test(base)) return base;
+  if (/\/chat\/completions$/i.test(base)) return base.replace(/\/chat\/completions$/i, '/models');
+  if (/\/api\/chat$/i.test(base)) return base.replace(/\/api\/chat$/i, '/api/tags');
   if (profile?.provider === 'openwebui') {
     if (/\/api$/i.test(base)) return base + '/models';
     if (!/\/api\//i.test(base)) return base + '/api/models';
@@ -346,7 +383,7 @@ export function modelsEndpoint(profile) {
 
 export function originPattern(profile) {
   try {
-    return new URL(profile.endpoint).origin + '/*';
+    return endpointUrl(profile.endpoint).origin + '/*';
   } catch {
     return '';
   }
@@ -354,7 +391,7 @@ export function originPattern(profile) {
 
 export function providerOrigin(profile) {
   try {
-    return new URL(profile.endpoint).origin;
+    return endpointUrl(profile.endpoint).origin;
   } catch {
     return '';
   }

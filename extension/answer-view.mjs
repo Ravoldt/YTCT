@@ -16,11 +16,15 @@ function commentLink(id, jump) {
 }
 
 function externalLink(href) {
-  if (!/^https?:\/\//i.test(href)) return document.createElement('span');
+  let url;
+  try { url = new URL(href); } catch { return document.createElement('span'); }
+  if (url.protocol !== 'https:' || url.username || url.password) return document.createElement('span');
   const link = document.createElement('a');
-  link.href = href;
+  link.href = url.href;
+  link.title = url.href;
   link.target = '_blank';
   link.rel = 'noopener noreferrer';
+  link.referrerPolicy = 'no-referrer';
   return link;
 }
 
@@ -58,7 +62,7 @@ function appendText(node, text, links, actions) {
 function makeLink(href, label, links, actions) {
   const reference = /^\[?(C[1-9]\d*)\]?$/.exec(label)?.[1];
   if (reference && links.comments.has(reference)) return commentLink(links.comments.get(reference), actions.jump);
-  if (sourceKey(href) === links.key) {
+  if (links.key && sourceKey(href) === links.key) {
     const url = new URL(href);
     const id = url.searchParams.get('lc');
     if (id && [...links.comments.values()].includes(id)) return commentLink(id, actions.jump);
@@ -76,8 +80,8 @@ function renderTokens(root, tokens, links, actions) {
     const parent = stack.at(-1);
     if (token.type === 'inline') renderTokens(parent, token.children || [], links, actions);
     else if (token.nesting === -1) {
-      if (token.tag === 'a') linkDepth--;
-      stack.pop();
+      if (token.tag === 'a') linkDepth = Math.max(0, linkDepth - 1);
+      if (stack.length > 1) stack.pop();
     } else if (token.type === 'text') {
       if (linkDepth) parent.append(token.content);
       else appendText(parent, token.content, links, actions);
@@ -97,7 +101,7 @@ function renderTokens(root, tokens, links, actions) {
     } else if (safeTags.has(token.tag) && !token.hidden) {
       const child = document.createElement(token.tag);
       const start = token.attrGet('start');
-      if (token.tag === 'ol' && /^\d+$/.test(start || '')) child.start = Number(start);
+      if (token.tag === 'ol' && /^\d+$/.test(start || '')) child.start = Math.min(1000000, Number(start));
       if (token.content) child.textContent = token.content;
       parent.append(child);
       if (token.nesting === 1) stack.push(child);

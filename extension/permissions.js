@@ -1,11 +1,10 @@
-'use strict';
+import { endpointUrl } from './llm-config.mjs';
 
 const byId = (id) => document.getElementById(id);
 let origin = '';
 
 try {
-  const url = new URL(new URLSearchParams(location.search).get('origin') || '');
-  if (!/^https?:$/.test(url.protocol)) throw new Error('unsupported protocol');
+  const url = endpointUrl(new URLSearchParams(location.search).get('origin') || '');
   origin = url.origin;
 } catch {
   origin = '';

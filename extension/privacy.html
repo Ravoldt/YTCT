@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy · YouTube Comment Toolkit</title>
+  <style>
+    :root { color-scheme: light dark; font: 100%/1.6 system-ui, sans-serif; }
+    body { margin: 0 auto; max-width: 72ch; padding: 2rem 1.25rem 4rem; }
+    h1, h2 { line-height: 1.25; }
+    h2 { margin-top: 2rem; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>YouTube Comment Toolkit Privacy Policy</h1>
+    <p>Effective November 22, 2026</p>
+    <p>YouTube Comment Toolkit helps you read, search, export, and ask questions about comments on YouTube videos and community posts. The extension has no developer-operated backend, advertising, analytics, or tracking. The developer does not receive your browsing activity, exports, conversations, or API keys through the extension.</p>
+
+    <h2>YouTube activity and exports</h2>
+    <p>On supported YouTube pages, the extension reads the current video or post identifier, title, and playback position, and can read comment responses YouTube already loads. When you choose Collect or use the page’s download button, the extension can request additional comments and replies from YouTube using the page’s existing session. YouTube receives those requests and may receive your YouTube session cookies as part of normal browser operation. The extension does not copy browser cookies or passwords into its storage, exports, or assistant prompts.</p>
+    <p>Collected data can include video or post metadata, comment and reply text, commenter names and channel identifiers, avatar links, timestamps, and engagement counts. The extension uses this information to display, search, and export comments. It can fetch avatars and source images from YouTube’s Google-hosted image services. If you import a Markdown or JSON export, the extension reads that file to make it available to the same features. Downloaded files are saved to your device at your request.</p>
+
+    <h2>Assistant requests and API keys</h2>
+    <p>Ask is optional. Before the first request for a destination on a visit, the extension shows the configured endpoint and the types of information the request can include. If you proceed, the selected endpoint receives your question, relevant earlier turns for the same profile and destination, and a selection of YouTube or imported material. This may include the source link, title, comment text, and commenter names. Video captions are included only if you enable the transcript setting. Ollama prompts can also include a thumbnail or post images.</p>
+    <p>Depending on your selection, recipients can include your own Ollama, Open WebUI, llama.cpp, LM Studio, or custom server, or a service you choose such as OpenAI, Anthropic, Google Gemini, OpenRouter, DeepSeek, Groq, Mistral, xAI, Together AI, Fireworks AI, Cerebras, SambaNova, Nebius, Perplexity, Moonshot, or Z.AI. A server on your device can forward requests to a cloud provider. The endpoint operator and any service it routes to handle data under their own terms and retention policies.</p>
+    <p>If you enter an API key, the extension saves it in this Chrome profile’s extension storage and sends it to its configured endpoint to authenticate model requests and connection checks. Load models makes a model-list request. Test can send a short sample prompt. These checks do not send the current comments or chat history. Keys are not synced and are not encrypted by the extension at rest. The extension uses HTTPS for non-loopback endpoints.</p>
+
+    <h2>Retention and controls</h2>
+    <ul>
+      <li>Keeping copies of exports in Chrome storage is off by default. If you enable it, the default retention is up to seven days, with earlier removal of unused entries or entries that exceed the cache budget. You can change the limits or choose <strong>Settings → General → Clear saved exports</strong> to remove saved copies.</li>
+      <li>Chat history is stored for the current visit in Chrome session storage. You can clear it with <strong>Clear chat</strong>. A change of source or assistant destination starts a separate conversation. Captions fetched for Ask are held in memory.</li>
+      <li>To remove a saved API key, choose <strong>Clear key</strong> and save, or delete the profile. You can revoke optional host permissions in Chrome’s extension settings. Removing the extension deletes its browser storage. Downloaded files, clipboard copies, and data already sent to a provider are managed separately.</li>
+    </ul>
+    <p>The extension is unavailable in Incognito.</p>
+
+    <h2>Limited Use</h2>
+    <p>YouTube Comment Toolkit’s use and transfer of information received from Google APIs adheres to the Chrome Web Store User Data Policy, including its Limited Use requirements. The developer does not sell user data or use it for advertising, creditworthiness, or lending.</p>
+    <p><a href="https://developer.chrome.com/docs/webstore/program-policies/limited-use">Chrome Web Store Limited Use requirements</a></p>
+
+    <h2>Contact</h2>
+    <p>For privacy questions, use the support contact on the YouTube Comment Toolkit Chrome Web Store listing or the distribution channel that provided your private copy.</p>
+  </main>
+</body>
+</html>

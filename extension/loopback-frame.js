@@ -1,6 +1,9 @@
 (() => {
   const extensionOrigin = chrome.runtime.getURL('').slice(0, -1);
-  if (location.href !== 'http://127.0.0.1:11434/' || location.ancestorOrigins[0] !== extensionOrigin) return;
+  if (location.href !== 'http://127.0.0.1:11434/'
+    || window.parent !== window.top
+    || location.ancestorOrigins?.length !== 1
+    || location.ancestorOrigins[0] !== extensionOrigin) return;
 
   let connection;
   const active = new Map();
@@ -35,17 +38,26 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
         credentials: 'omit',
+        redirect: 'error',
         signal: controller.signal,
       });
       send('head', { status: response.status });
+      if (!response.body) {
+        send('end');
+        return;
+      }
       const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+      let length = 0;
       try {
         for (;;) {
           const { done, value } = await reader.read();
           if (done) break;
+          length += value.length;
+          if (length > 4 * 1024 * 1024) throw new Error('The local model response exceeded the size limit.');
           send('chunk', { text: value });
         }
       } finally {
+        await reader.cancel().catch(() => {});
         reader.releaseLock();
       }
       send('end');

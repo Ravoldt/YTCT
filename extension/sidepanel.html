@@ -24,16 +24,20 @@
   <div id="notice" role="status" class="notice" hidden></div>
   <div id="collection" class="collection" hidden>
     <span id="collection-status" role="status"></span>
-    <button id="collect" class="pill" type="button">Collect</button>
+    <div>
+      <button id="collect" class="pill" type="button">Collect</button>
+      <button id="download-export" class="pill" type="button" hidden>Download</button>
+    </div>
   </div>
   <main id="comments" aria-label="Comments and replies" tabindex="0"></main>
 
-  <section id="ai" class="ask" aria-label="Ask Gemma" hidden>
+  <section id="ai" class="ask" aria-label="Ask LLM" hidden>
     <div id="ai-resize" class="ask-resize" role="separator" aria-orientation="horizontal"
-      aria-label="Resize Ask Gemma" aria-valuemin="110" tabindex="0" title="Drag to resize"></div>
+      aria-label="Resize Ask LLM" aria-valuemin="110" tabindex="0" title="Drag to resize"></div>
     <div class="ask-bar">
-      <h2 id="ai-heading">Ask Gemma</h2>
+      <h2 id="ai-heading">Ask LLM</h2>
       <span id="ai-status" role="status">Ready</span>
+      <button id="clear-chat" class="pill" type="button" title="Clear this conversation">Clear chat</button>
     </div>
     <div id="ai-cost" class="ai-cost" hidden></div>
     <div id="telemetry" class="telemetry" hidden></div>
@@ -51,9 +55,9 @@
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.6"/><path d="m16 16 4.5 4.5"/></svg>
         Search
       </button>
-      <button id="ai-mode" type="button" aria-pressed="false" aria-label="Ask Gemma">
+      <button id="ai-mode" type="button" aria-pressed="false" aria-label="Ask LLM">
         <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v4l4-4h6a2 2 0 0 0 2-2v-3M7 8h5m-5 4h8"/><path class="spark" d="m19 2 1.2 3.3L23.5 6.5l-3.3 1.2L19 11l-1.2-3.3L14.5 6.5l3.3-1.2L19 2z"/></svg>
-        <span id="ai-mode-label">Ask Gemma</span>
+        <span id="ai-mode-label">Ask LLM</span>
       </button>
     </div>
     <form id="composer">
@@ -95,28 +99,33 @@
         </fieldset>
         <fieldset>
           <legend>Assistant</legend>
-          <label>Include video transcript <input name="includeTranscript" type="checkbox"></label>
+          <label>Allow Ask to send the video transcript <input name="shareTranscript" type="checkbox"></label>
           <label>Context window (tokens) <input name="contextWindow" type="number" min="1024" max="262144" required></label>
           <label>Show model telemetry <input name="debugOllama" type="checkbox"></label>
         </fieldset>
         <fieldset>
           <legend>Exports</legend>
           <label>Download format <select name="format"><option value="markdown">Markdown</option><option value="json">JSON</option></select></label>
+          <label>Keep copies in Chrome storage <input name="cacheEnabled" type="checkbox"></label>
           <label>Keep exports (days) <input name="cacheDays" type="number" min="1" max="3650" required></label>
           <label>Unused exports (hours after leaving) <input name="unusedCacheHours" type="number" min="1" max="8760" required></label>
           <label>Cache limit (MB) <input name="cacheMB" type="number" min="1" max="1000" required></label>
           <p id="cache-usage" class="hint" role="status"></p>
           <button type="button" id="import-export" class="pill">Open Markdown or JSON export</button>
+          <button type="button" id="load-saved-export" class="pill">Load saved export</button>
+          <button type="button" id="clear-cache" class="pill">Clear saved exports</button>
           <button type="button" id="collect-fresh" class="pill">Collect fresh comments</button>
+          <p class="hint">Saved copies can outlast a YouTube account change. Load them only from a Chrome profile you trust.</p>
           <input id="import-file" type="file" accept=".md,.markdown,.json" hidden>
         </fieldset>
+        <p class="hint"><a href="privacy.html" target="_blank" rel="noopener">Privacy policy</a></p>
         <p id="settings-error" class="settings-error" role="status" hidden></p>
         <button type="submit" class="pill primary save-settings">Save settings</button>
       </div>
     </form>
 
     <div id="settings-llm" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-llm" hidden>
-        <p class="hint">API keys stay in this extension’s local background storage, masked unless you reveal or copy one. Anyone who can read this browser profile’s extension storage can read them; keep provider-side spending limits. See the README for the threat model.</p>
+        <p class="hint">API keys are saved in this Chrome profile and sent to the configured endpoint. Load models sends a model-list request. Test also sends a short sample prompt to compatible endpoints.</p>
         <div class="llm-top">
           <label>Active profile <select id="llm-profile-select"></select></label>
           <div class="button-row">
@@ -134,10 +143,9 @@
 
         <fieldset>
           <legend id="llm-form-title">New profile</legend>
-          <label>Profile name <input id="llm-label" maxlength="60" autocomplete="off" placeholder="My local model"></label>
+          <label>Profile name <input id="llm-label" maxlength="60" autocomplete="off" placeholder="Profile name"></label>
           <label>Provider
             <select id="llm-provider">
-              <option value="ollama">Ollama (local)</option>
               <option value="cloud">Custom OpenAI-compatible</option>
             </select>
           </label>
@@ -151,7 +159,7 @@
           </label>
           <datalist id="llm-model-options"></datalist>
           <p id="llm-model-status" class="hint" role="status"></p>
-          <label>API key <input id="llm-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Optional for local servers"></label>
+          <label>API key <input id="llm-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="API key"></label>
           <div class="key-actions">
             <span id="llm-key-mask" class="hint">No saved key</span>
             <button type="button" id="llm-reveal" class="pill">Reveal</button>
@@ -181,7 +189,7 @@
 
         <fieldset>
           <legend>Assistant name</legend>
-          <label>Name <input id="llm-assistant-name" maxlength="32" autocomplete="off" placeholder="Gemma"></label>
+          <label>Name <input id="llm-assistant-name" maxlength="32" autocomplete="off" placeholder="LLM"></label>
           <p class="hint">Used by the Ask button and heading. Leave blank to derive it from the model.</p>
         </fieldset>
     </div>

@@ -1,7 +1,7 @@
 // Isolated-world controls and the fixed collector bridge.
 (() => {
   'use strict';
-  const { sourceKey, isMediaSource, buildMarkdown, buildJson, sanitizeName, stamp } = YTCT;
+  const { sourceKey, isMediaSource, maxEntryBytes, sanitizeName, stamp } = YTCT;
   const svgNS = 'http://www.w3.org/2000/svg';
   const documentId = crypto.randomUUID();
   const downloaderId = 'ytct-download';
@@ -9,6 +9,9 @@
   const toolbarId = 'ytct-toolbar';
   const pending = new Map();
   const panels = new Set();
+  const pendingPorts = new Set();
+  const bridgeQueue = [];
+  let bridgePort = null;
   let source = null;
   let counter = 0;
   let mountTimer;
@@ -21,6 +24,59 @@
     return reply.value;
   }
 
+  function onBridgeMessage(port, { data: message }) {
+    if (message?.event === 'ready') {
+      if (!bridgePort) {
+        bridgePort = port;
+        for (const other of pendingPorts) {
+          if (other !== port) other.close();
+        }
+        pendingPorts.clear();
+        window.removeEventListener('message', onBridgeReady);
+        for (const payload of bridgeQueue.splice(0)) {
+          if (pending.has(payload.id)) bridgePort.postMessage(payload);
+        }
+      }
+      return;
+    }
+    if (port !== bridgePort || !source || !message || message.key !== source.key || sourceKey(location.href) !== source.key) return;
+    if (message.event === 'progress' && message.progress && typeof message.progress.running === 'boolean') {
+      const { running, ratio, count, status, reason } = message.progress;
+      source.progress = {
+        running, ratio: Number.isFinite(ratio) ? Math.min(100, Math.max(0, ratio)) : 0,
+        count: Number.isSafeInteger(count) && count > 0 ? count : 0,
+        status: typeof status === 'string' ? status.slice(0, 24) : '',
+        reason: typeof reason === 'string' ? reason.slice(0, 512) : '',
+      };
+      refreshDownloads();
+      sendAll(stateForPanel());
+      return;
+    }
+    const request = pending.get(message.id);
+    if (!request || request.key !== message.key) return;
+    clearTimeout(request.timer);
+    pending.delete(message.id);
+    if (message.error) {
+      request.reject(new Error(typeof message.error === 'string' ? message.error.slice(0, 512) : 'YouTube request failed.'));
+    } else request.resolve(message.value);
+  }
+
+  function offerBridge() {
+    if (bridgePort || pendingPorts.size >= 4) return;
+    const channel = new MessageChannel();
+    const port = channel.port1;
+    pendingPorts.add(port);
+    port.onmessage = (event) => onBridgeMessage(port, event);
+    window.postMessage({ channel: 'ytct-page-init' }, location.origin, [channel.port2]);
+  }
+
+  function onBridgeReady(event) {
+    if (bridgePort || event.source !== window || event.origin !== location.origin || event.data?.channel !== 'ytct-page-ready') return;
+    offerBridge();
+  }
+  window.addEventListener('message', onBridgeReady);
+  offerBridge();
+
   function page(action, current, extra) {
     const id = crypto.randomUUID();
     return new Promise((resolve, reject) => {
@@ -29,7 +85,12 @@
         reject(new Error('YouTube did not answer the ' + action + ' request. Reload this tab and try again.'));
       }, action === 'collect' ? 91 * 60000 : 30000);
       pending.set(id, { key: current.key, resolve, reject, timer });
-      window.postMessage({ channel: 'ytct-page-request', id, key: current.key, action, ...extra }, location.origin);
+      const payload = { id, key: current.key, action, ...extra };
+      if (bridgePort) bridgePort.postMessage(payload);
+      else {
+        bridgeQueue.push(payload);
+        offerBridge();
+      }
     });
   }
 
@@ -152,7 +213,7 @@
   }
 
   function stateForPanel() {
-    return { event: 'page', key: source?.key || '', pageId: source?.pageId, title: title(),
+    return { event: 'page', key: source?.mounted ? source.key : '', pageId: source?.pageId, title: title(),
       progress: source?.progress, media: mediaTime(), dark: document.documentElement?.hasAttribute('dark') };
   }
 
@@ -167,17 +228,22 @@
     }
     pending.clear();
     const current = source = { key, pageId: documentId + ':' + ++counter, progress: {}, mounted: false };
-    current.bound = worker({ type: 'visit', key, pageId: current.pageId, href: location.href }).then((binding) => {
+    async function bindVisit() {
+      for (let attempt = 0; source === current; attempt++) {
+        try { return await worker({ type: 'visit', key, pageId: current.pageId }); }
+        catch (error) {
+          if (attempt === 3 || error.message !== 'The page changed.') throw error;
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
+    }
+    current.bound = bindVisit().then(() => {
       if (source === current) {
         current.mounted = true;
-        current.settings = binding.settings;
-        current.saved = binding.saved;
         refresh();
         sendAll(stateForPanel());
-        scheduleCollection(current);
         if (panels.size) ensureTheater();
       }
-      return binding;
     });
     current.bound.catch((error) => {
       if (source === current) {
@@ -190,75 +256,28 @@
     return current;
   }
 
-  function scheduleCollection(current) {
-    if (current.scheduled || !isMediaSource(current.key) || document.readyState !== 'complete'
-      || current.saved?.status === 'complete' || current.saved?.status === 'imported') return;
-    current.scheduled = true;
-    const measure = () => {
-      const element = document.querySelector(current.key.startsWith('video:') ? '#movie_player' : 'ytd-post-renderer');
-      return element ? element.offsetWidth + 'x' + element.offsetHeight : '';
-    };
-    const size = measure();
-    setTimeout(() => {
-      if (source !== current) return;
-      if (measure() !== size) {
-        current.scheduled = false;
-        scheduleCollection(current);
-      } else collect(current, { background: true }).catch(() => {});
-    }, 3200);
-  }
-
-  function filename(entry, format) {
-    const suffix = format === 'json' ? '.json' : '.md';
-    const name = entry.stem || 'youtube-comments';
-    return name + suffix;
-  }
-
-  function saveFile(entry, format) {
-    if (format === 'json' && !entry.snapshot) {
-      throw new Error('Collect the comments again to export them as JSON.');
-    }
-    const content = format === 'json' ? buildJson(entry.snapshot) : entry.markdown || buildMarkdown(entry.snapshot);
-    const url = URL.createObjectURL(new Blob([content], { type: format === 'json' ? 'application/json' : 'text/markdown;charset=utf-8' }));
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = filename(entry, format);
-    document.body.append(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-  }
-
-  async function readCache(current) {
-    await current.bound;
-    return await worker({ type: 'read-cache', key: current.key }) || current.export || null;
-  }
-
-  function collect(current, { background = false, force = false, fresh = false } = {}) {
+  function collect(current, { fresh = false } = {}) {
     if (current.job) return current.job;
     const action = async () => {
       if (source !== current) return null;
       await current.bound;
-      const cached = await readCache(current);
-      if (!force && cached && (!background || cached.snapshot?.collection?.status === 'complete')) return cached;
+      if (source !== current) return null;
       current.progress = { running: true, ratio: 0 };
       refreshDownloads();
       sendAll(stateForPanel());
-      const { snapshot, result } = await page('collect', current, { background, fresh });
+      const { snapshot, result } = await page('collect', current, { fresh });
       if (source !== current) return null;
       if (!snapshot) {
         if (result?.status === 'stopped') return null;
-        if (background && !current.retried) {
-          // Some videos only expose the first continuation after their comment section initializes.
-          current.waitingForTokens = true;
-        }
         throw new Error(result?.reason || 'YouTube returned no comments.');
+      }
+      if (!snapshot.metadata || !Array.isArray(snapshot.comments)
+        || new Blob([JSON.stringify(snapshot)]).size > maxEntryBytes - 1024) {
+        throw new Error('YouTube returned an invalid or oversized comment export.');
       }
       const meta = snapshot.metadata;
       const stem = sanitizeName([meta.channel, meta.title, stamp(new Date(snapshot.startedAt || Date.now()))].filter(Boolean).join(' '), 180).replace(/\s+/g, '_');
-      const entry = current.export = { snapshot, stem, transcript: cached?.transcript };
-      const write = await worker({ type: 'write-cache', key: current.key, entry });
-      if (!write.saved) current.notice = write.reason;
+      const entry = current.export = { snapshot, stem };
       sendAll({ event: 'export', key: current.key, pageId: current.pageId, entry, notice: current.notice });
       return entry;
     };
@@ -283,12 +302,10 @@
     current.download = true;
     refreshDownloads();
     try {
-      await worker({ type: 'mark-used', key: current.key });
-      if (source !== current) return;
-      const { settings } = await worker({ type: 'settings' });
-      let entry = current.job ? await current.job : await readCache(current);
-      if (!entry || (settings.format === 'json' && !entry.snapshot)) entry = await collect(current, { force: !!entry });
-      if (entry && current === source) saveFile(entry, settings.format);
+      const identity = { key: current.key, pageId: current.pageId };
+      if (!current.job && !current.export && await worker({ type: 'download-cache', ...identity })) return;
+      const entry = await (current.job || current.export || collect(current));
+      if (entry && current === source) await worker({ type: 'download-export', ...identity, entry });
     } finally {
       current.download = false;
       if (current === source) refreshDownloads();
@@ -484,18 +501,31 @@
   // Community post images have no close-up view on YouTube. A full-screen button opens a
   // borderless overlay: click for 1:1, then drag or scroll to pan.
   const decoratedImages = new WeakSet();
+  const imageCdnHosts = new Set(['yt3.ggpht.com', 'yt3.googleusercontent.com', 'lh3.googleusercontent.com', 'i.ytimg.com']);
   let imageViewer = null;
 
-  function originalImageUrl(raw) {
+  function safeImageUrl(raw) {
     try {
       const url = new URL(raw, location.href);
-      if (!/^https?:$/.test(url.protocol)) return raw;
+      if (url.protocol !== 'https:' || url.username || url.password) return '';
+      return url.href;
+    } catch {
+      return '';
+    }
+  }
+
+  function originalImageUrl(raw) {
+    const safe = safeImageUrl(raw);
+    if (!safe) return '';
+    try {
+      const url = new URL(safe);
+      if (!imageCdnHosts.has(url.hostname)) return safe;
       // Google's image CDN keeps its resize/crop directive at the end of the path.
       const match = /=(?:w\d+-h\d+|s\d+)[^/]*$/.exec(url.pathname);
       if (match) url.pathname = url.pathname.slice(0, match.index) + '=s0';
       return url.href;
     } catch {
-      return raw;
+      return safe;
     }
   }
 
@@ -510,6 +540,7 @@
     const image = document.createElement('img');
     image.alt = '';
     image.decoding = 'async';
+    image.referrerPolicy = 'no-referrer';
     image.draggable = false;
     image.hidden = true;
     image.style.cssText = 'position:absolute;left:0;top:0;display:block;max-width:none;max-height:none;' +
@@ -599,7 +630,9 @@
     }
 
     function open(url, fallback) {
-      if (!url) return;
+      const safeUrl = safeImageUrl(url);
+      const safeFallback = safeImageUrl(fallback);
+      if (!safeUrl) return;
       if (!state.open) state.previousOverflow = document.documentElement.style.overflow;
       state.open = true;
       state.width = 0;
@@ -611,11 +644,11 @@
       image.hidden = true;
       image.style.width = '0px';
       image.style.height = '0px';
-      image.dataset.fallback = fallback && fallback !== url ? fallback : '';
+      image.dataset.fallback = safeFallback && safeFallback !== safeUrl ? safeFallback : '';
       root.style.display = 'block';
       root.style.cursor = 'zoom-in';
       document.documentElement.style.overflow = 'hidden';
-      image.src = url;
+      image.src = safeUrl;
       document.addEventListener('keydown', onKey, true);
     }
 
@@ -718,7 +751,7 @@
         event.preventDefault();
         event.stopPropagation();
         const current = host.querySelector('img') || image;
-        const src = current.currentSrc || current.src;
+        const src = safeImageUrl(current.currentSrc || current.src);
         if (src) openImageViewer(originalImageUrl(src), src);
       });
       host.append(trigger);
@@ -735,31 +768,17 @@
     }, 250);
   }
 
-  window.addEventListener('message', (event) => {
-    const message = event.data;
-    if (event.source !== window || event.origin !== location.origin || message?.channel !== 'ytct-page-result'
-      || message.key !== source?.key || sourceKey(location.href) !== source.key) return;
-    if (message.event === 'progress' && message.progress && typeof message.progress.running === 'boolean') {
-      source.progress = message.progress;
-      refreshDownloads();
-      sendAll(stateForPanel());
-      if (source.waitingForTokens && message.progress.count > 0 && !source.job) {
-        source.waitingForTokens = false;
-        source.retried = true;
-        collect(source, { background: true }).catch(() => {});
-      }
+  chrome.runtime.onConnect.addListener((port) => {
+    const extensionOrigin = chrome.runtime.getURL('').slice(0, -1);
+    let fromPanel = false;
+    try {
+      const url = new URL(port.sender?.url || '');
+      fromPanel = url.origin === extensionOrigin && url.pathname === '/sidepanel.html';
+    } catch {}
+    if (port.name !== 'ytct-tab' || port.sender?.id !== chrome.runtime.id || !fromPanel) {
+      try { port.disconnect(); } catch {}
       return;
     }
-    const request = pending.get(message.id);
-    if (!request || request.key !== message.key) return;
-    clearTimeout(request.timer);
-    pending.delete(message.id);
-    if (message.error) request.reject(new Error(message.error));
-    else request.resolve(message.value);
-  });
-
-  chrome.runtime.onConnect.addListener((port) => {
-    if (port.name !== 'ytct-tab' || port.sender?.id !== chrome.runtime.id) return;
     panels.add(port);
     port.postMessage(stateForPanel());
     bindVideo();
@@ -781,9 +800,16 @@
       if (!current || message.key !== current.key || typeof message.id !== 'string') return;
       async function handle() {
         if (message.action === 'seek') return seek(message.seconds);
-        if (message.action === 'load') return readCache(current);
-        if (message.action === 'collect') return collect(current, { background: !message.force, force: !!message.force, fresh: !!message.fresh });
-        if (message.action === 'stop' || message.action === 'transcript') return page(message.action, current);
+        if (message.action === 'load-collected') return current.export || null;
+        if (message.action === 'collect') return collect(current, { fresh: !!message.fresh });
+        if (message.action === 'stop') return page('stop', current);
+        if (message.action === 'transcript') {
+          const value = await page('transcript', current);
+          if (value?.ok === true && typeof value.text === 'string' && value.text.length <= 512 * 1024) {
+            return { ok: true, text: value.text, segments: Number.isSafeInteger(value.segments) ? value.segments : 0 };
+          }
+          return { ok: false, reason: typeof value?.reason === 'string' ? value.reason.slice(0, 512) : '' };
+        }
         throw new Error('Unsupported panel action.');
       }
       const respond = (reply) => {
@@ -805,7 +831,6 @@
     scheduleMount();
     sendAll(stateForPanel());
   });
-  window.addEventListener('load', () => scheduleCollection(scanSource()), { once: true });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();
 })();

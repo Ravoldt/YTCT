@@ -74,4 +74,5 @@ out/
 
 # Temprorary/helper files
 .dev
+tests
 

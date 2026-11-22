@@ -1,4 +1,5 @@
-// Panel-side client for OpenAI-compatible providers. The API key never leaves the background.
+// Panel-side client for OpenAI-compatible providers. Credentials are handled in extension background contexts.
+import { profileDestination } from './llm-config.mjs';
 export function isContextError(message) {
   return /maximum context|context.{0,45}(limit|exceed|overflow|too long)|prompt.{0,45}(too long|exceed)|input length/i.test(String(message || ''));
 }
@@ -88,7 +89,7 @@ export async function askRemote(session, history, question, settings, profile, o
     let visible = false;
     let result;
     try {
-      result = await streamRemote({ profileId: profile.id, messages, thinking }, signal, (update) => {
+      result = await streamRemote({ profileId: profile.id, destination: profileDestination(profile), messages, thinking }, signal, (update) => {
         if (String(update.content || '').trim()) visible = true;
         onChange({ content: update.content, thinking: update.thinking, usage: update.usage, links: context.links });
       });
