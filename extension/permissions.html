@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Allow network access · YouTube Comment Toolkit</title>
+  <link rel="stylesheet" href="permissions.css">
+</head>
+<body>
+  <main>
+    <h1>Allow network access</h1>
+    <p>The assistant needs permission to send API requests to:</p>
+    <code id="origin">…</code>
+    <p class="note">This grants network access to that host only. API keys are never placed in this page; requests and keys stay in the extension’s background context.</p>
+    <button id="grant" type="button">Allow access</button>
+    <p id="status" class="status" role="status"></p>
+    <p class="note">You can close this tab after granting access. Return to the side panel and click <strong>Test connection</strong>.</p>
+  </main>
+  <script src="permissions.js"></script>
+</body>
+</html>

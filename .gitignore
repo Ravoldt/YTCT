@@ -1,0 +1,77 @@
+# OS junk
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# Editors and IDEs
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+.~*
+
+# Node tooling (local companion / future build scripts)
+node_modules/
+.pnpm-store/
+.yarn/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.npm/
+.eslintcache
+.stylelintcache
+.cache/
+.parcel-cache/
+coverage/
+.nyc_output/
+playwright-report/
+test-results/
+
+# Python tooling (local companion)
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets and keys
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Build output and packaged extensions
+dist/
+build/
+out/
+*.zip
+*.crx
+*.xpi
+
+# Logs and scratch files
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+
+# Temprorary/helper files
+.dev
+

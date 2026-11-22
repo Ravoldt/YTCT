@@ -1,0 +1,811 @@
+// Isolated-world controls and the fixed collector bridge.
+(() => {
+  'use strict';
+  const { sourceKey, isMediaSource, buildMarkdown, buildJson, sanitizeName, stamp } = YTCT;
+  const svgNS = 'http://www.w3.org/2000/svg';
+  const documentId = crypto.randomUUID();
+  const downloaderId = 'ytct-download';
+  const openerId = 'ytct-side-panel';
+  const toolbarId = 'ytct-toolbar';
+  const pending = new Map();
+  const panels = new Set();
+  let source = null;
+  let counter = 0;
+  let mountTimer;
+  let mediaTimer;
+  let media = null;
+
+  async function worker(message) {
+    const reply = await chrome.runtime.sendMessage(message);
+    if (!reply?.ok) throw new Error(reply?.error || 'The extension is unavailable. Reload this tab.');
+    return reply.value;
+  }
+
+  function page(action, current, extra) {
+    const id = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        reject(new Error('YouTube did not answer the ' + action + ' request. Reload this tab and try again.'));
+      }, action === 'collect' ? 91 * 60000 : 30000);
+      pending.set(id, { key: current.key, resolve, reject, timer });
+      window.postMessage({ channel: 'ytct-page-request', id, key: current.key, action, ...extra }, location.origin);
+    });
+  }
+
+  function sendAll(message) {
+    for (const port of panels) {
+      try { port.postMessage(message); } catch {}
+    }
+  }
+
+  function video() {
+    if (!source?.key.startsWith('video:')) return null;
+    const watch = document.querySelector('ytd-watch-flexy[video-id]');
+    if (watch?.getAttribute('video-id') !== source.key.slice(6)) return null;
+    const player = watch.querySelector('#movie_player');
+    if (player?.classList.contains('ad-showing') || player?.classList.contains('ad-interrupting')) return null;
+    return player?.querySelector('video.html5-main-video, video') || null;
+  }
+
+  function mediaTime() {
+    const player = video();
+    if (!player) return null;
+    return { currentTime: player.currentTime, duration: Number.isFinite(player.duration) ? player.duration : null };
+  }
+
+  function sendTime(event) {
+    sendAll({ event: 'time', key: source?.key, media: mediaTime(), seek: !!event && event.type !== 'timeupdate' });
+  }
+
+  function bindVideo() {
+    const found = panels.size ? video() : null;
+    if (found === media) return;
+    for (const event of ['timeupdate', 'seeked', 'loadedmetadata', 'durationchange']) {
+      media?.removeEventListener(event, sendTime);
+      found?.addEventListener(event, sendTime);
+    }
+    media = found;
+    if (panels.size) sendTime();
+  }
+
+  function seek(seconds) {
+    const player = video();
+    if (!player || player.readyState === 0 || !Number.isFinite(seconds) || seconds < 0) return false;
+    if (Number.isFinite(player.duration)) {
+      if (seconds > player.duration) return false;
+    } else {
+      let inRange = false;
+      for (let i = 0; i < player.seekable.length; i++) inRange ||= player.seekable.start(i) <= seconds && seconds <= player.seekable.end(i);
+      if (!inRange) return false;
+    }
+    try { player.currentTime = seconds; } catch { return false; }
+    return true;
+  }
+
+  function title() {
+    return document.title.replace(/\s*-\s*YouTube\s*$/, '').trim();
+  }
+
+  // ---- theater mode while the side panel is open
+  // The comments replace the recommendations visually, without changing YouTube's layout.
+  const theater = { owned: false };
+  let theaterTimer = null;
+  let alignTimer = null;
+  let headerObserver = null;
+  window.addEventListener('resize', () => {
+    clearTimeout(alignTimer);
+    alignTimer = setTimeout(alignToolbar, 120);
+  });
+
+  function theaterActive() {
+    return !!document.querySelector('ytd-watch-flexy[theater]');
+  }
+
+  function theaterButton() {
+    const watch = document.querySelector('ytd-watch-flexy');
+    const player = watch?.querySelector('#movie_player') || document.querySelector('#movie_player');
+    return player?.querySelector('.ytp-size-button') || null;
+  }
+
+  function markTheaterOwned(owned) {
+    theater.owned = owned;
+    try {
+      if (owned) sessionStorage.setItem('ytct-theater-owned', '1');
+      else sessionStorage.removeItem('ytct-theater-owned');
+    } catch {}
+  }
+
+  function ensureTheater(attempt = 0) {
+    clearTimeout(theaterTimer);
+    if (!panels.size || !source?.mounted || !source.key.startsWith('video:')) return;
+    if (theaterActive()) {
+      // A previous document may have turned theater on for this panel.
+      try { if (sessionStorage.getItem('ytct-theater-owned') === '1') theater.owned = true; } catch {}
+      return;
+    }
+    const button = theaterButton();
+    if (!button) {
+      if (attempt < 12) theaterTimer = setTimeout(() => ensureTheater(attempt + 1), 500);
+      return;
+    }
+    button.click();
+    markTheaterOwned(true);
+    setTimeout(alignToolbar, 350);
+  }
+
+  function restoreTheater() {
+    clearTimeout(theaterTimer);
+    if (!theater.owned) return;
+    markTheaterOwned(false);
+    if (!source?.key.startsWith('video:') || !theaterActive()) return;
+    theaterButton()?.click();
+    setTimeout(alignToolbar, 350);
+  }
+
+  function refreshOpener() {
+    const button = document.getElementById(openerId);
+    if (!button) return;
+    const label = panels.size ? 'Close comments side panel' : 'Open comments side panel';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+  }
+
+  function stateForPanel() {
+    return { event: 'page', key: source?.key || '', pageId: source?.pageId, title: title(),
+      progress: source?.progress, media: mediaTime(), dark: document.documentElement?.hasAttribute('dark') };
+  }
+
+  function scanSource() {
+    const key = sourceKey(location.href);
+    if (source?.key === key) return source;
+    clearTimeout(mountTimer);
+    mountTimer = null;
+    for (const request of pending.values()) {
+      clearTimeout(request.timer);
+      request.reject(new Error('YouTube source changed.'));
+    }
+    pending.clear();
+    const current = source = { key, pageId: documentId + ':' + ++counter, progress: {}, mounted: false };
+    current.bound = worker({ type: 'visit', key, pageId: current.pageId, href: location.href }).then((binding) => {
+      if (source === current) {
+        current.mounted = true;
+        current.settings = binding.settings;
+        current.saved = binding.saved;
+        refresh();
+        sendAll(stateForPanel());
+        scheduleCollection(current);
+        if (panels.size) ensureTheater();
+      }
+      return binding;
+    });
+    current.bound.catch((error) => {
+      if (source === current) {
+        current.progress = { status: 'error', reason: error.message };
+        sendAll(stateForPanel());
+      }
+    });
+    sendAll(stateForPanel());
+    bindVideo();
+    return current;
+  }
+
+  function scheduleCollection(current) {
+    if (current.scheduled || !isMediaSource(current.key) || document.readyState !== 'complete'
+      || current.saved?.status === 'complete' || current.saved?.status === 'imported') return;
+    current.scheduled = true;
+    const measure = () => {
+      const element = document.querySelector(current.key.startsWith('video:') ? '#movie_player' : 'ytd-post-renderer');
+      return element ? element.offsetWidth + 'x' + element.offsetHeight : '';
+    };
+    const size = measure();
+    setTimeout(() => {
+      if (source !== current) return;
+      if (measure() !== size) {
+        current.scheduled = false;
+        scheduleCollection(current);
+      } else collect(current, { background: true }).catch(() => {});
+    }, 3200);
+  }
+
+  function filename(entry, format) {
+    const suffix = format === 'json' ? '.json' : '.md';
+    const name = entry.stem || 'youtube-comments';
+    return name + suffix;
+  }
+
+  function saveFile(entry, format) {
+    if (format === 'json' && !entry.snapshot) {
+      throw new Error('Collect the comments again to export them as JSON.');
+    }
+    const content = format === 'json' ? buildJson(entry.snapshot) : entry.markdown || buildMarkdown(entry.snapshot);
+    const url = URL.createObjectURL(new Blob([content], { type: format === 'json' ? 'application/json' : 'text/markdown;charset=utf-8' }));
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename(entry, format);
+    document.body.append(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+  }
+
+  async function readCache(current) {
+    await current.bound;
+    return await worker({ type: 'read-cache', key: current.key }) || current.export || null;
+  }
+
+  function collect(current, { background = false, force = false, fresh = false } = {}) {
+    if (current.job) return current.job;
+    const action = async () => {
+      if (source !== current) return null;
+      await current.bound;
+      const cached = await readCache(current);
+      if (!force && cached && (!background || cached.snapshot?.collection?.status === 'complete')) return cached;
+      current.progress = { running: true, ratio: 0 };
+      refreshDownloads();
+      sendAll(stateForPanel());
+      const { snapshot, result } = await page('collect', current, { background, fresh });
+      if (source !== current) return null;
+      if (!snapshot) {
+        if (result?.status === 'stopped') return null;
+        if (background && !current.retried) {
+          // Some videos only expose the first continuation after their comment section initializes.
+          current.waitingForTokens = true;
+        }
+        throw new Error(result?.reason || 'YouTube returned no comments.');
+      }
+      const meta = snapshot.metadata;
+      const stem = sanitizeName([meta.channel, meta.title, stamp(new Date(snapshot.startedAt || Date.now()))].filter(Boolean).join(' '), 180).replace(/\s+/g, '_');
+      const entry = current.export = { snapshot, stem, transcript: cached?.transcript };
+      const write = await worker({ type: 'write-cache', key: current.key, entry });
+      if (!write.saved) current.notice = write.reason;
+      sendAll({ event: 'export', key: current.key, pageId: current.pageId, entry, notice: current.notice });
+      return entry;
+    };
+    const locks = window.navigator?.locks;
+    current.job = (locks ? locks.request('ytct-extension:' + current.key, action) : action()).catch((error) => {
+      if (source === current) current.progress = { ...current.progress, running: false, status: 'error', reason: error.message };
+      throw error;
+    }).finally(() => {
+      current.job = null;
+      current.progress.running = false;
+      if (source === current) {
+        refreshDownloads();
+        sendAll(stateForPanel());
+      }
+    });
+    return current.job;
+  }
+
+  async function download() {
+    const current = source;
+    if (!current?.mounted || current.download) return;
+    current.download = true;
+    refreshDownloads();
+    try {
+      await worker({ type: 'mark-used', key: current.key });
+      if (source !== current) return;
+      const { settings } = await worker({ type: 'settings' });
+      let entry = current.job ? await current.job : await readCache(current);
+      if (!entry || (settings.format === 'json' && !entry.snapshot)) entry = await collect(current, { force: !!entry });
+      if (entry && current === source) saveFile(entry, settings.format);
+    } finally {
+      current.download = false;
+      if (current === source) refreshDownloads();
+    }
+  }
+
+  function visible(element) {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    return rect.width > 0 && rect.height > 0;
+  }
+
+  function anchor() {
+    const header = [...document.querySelectorAll('ytd-comments-header-renderer')].find(visible);
+    return header?.querySelector('#sort-menu, yt-sort-filter-sub-menu-renderer') || header?.querySelector('#count')?.parentElement
+      || [...document.querySelectorAll('yt-sort-filter-sub-menu-renderer, #sort-menu')].find(visible);
+  }
+
+  function svg(name, attributes = {}) {
+    const element = document.createElementNS(svgNS, name);
+    for (const [key, value] of Object.entries(attributes)) element.setAttribute(key, value);
+    return element;
+  }
+
+  const darkTheme = () => document.documentElement.hasAttribute('dark');
+
+  function parseColor(value) {
+    const match = /rgba?\(([^)]+)\)/.exec(String(value || ''));
+    if (!match) return null;
+    const parts = match[1].split(',').map(Number);
+    return parts.length >= 3 && parts.slice(0, 3).every(Number.isFinite) ? parts : null;
+  }
+
+  function luminance(parts) {
+    const channel = (value) => {
+      const v = value / 255;
+      return v <= 0.03928 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
+    };
+    return 0.2126 * channel(parts[0]) + 0.7152 * channel(parts[1]) + 0.0722 * channel(parts[2]);
+  }
+
+  // Page text tokens can resolve to the hidden comment header's colour, so sample what is
+  // actually painted behind the controls and fall back to the theme attribute.
+  function backdropIsDark(element) {
+    for (let node = element; node; node = node.parentElement) {
+      const color = parseColor(getComputedStyle(node).backgroundColor);
+      if (color && (color[3] ?? 1) > 0.5) return luminance(color) < 0.5;
+    }
+    return darkTheme();
+  }
+
+  function applyToolbarColors() {
+    const downloadButton = document.getElementById(downloaderId);
+    if (!downloadButton) return;
+    const dark = backdropIsDark(downloadButton);
+    for (const button of [downloadButton, document.getElementById(openerId)]) {
+      if (!button) continue;
+      button.style.color = dark ? '#f1f1f1' : '#0f0f0f';
+      const circle = button.querySelector('.ytct-progress');
+      if (circle) circle.style.stroke = dark ? '#3ea6ff' : '#065fd4';
+    }
+  }
+
+  // #sort-menu is a block whose inline children baseline-align, and YouTube lifts its sort trigger
+  // with a negative margin. Line our buttons and the Sort by control up with the count heading.
+  function alignToolbar() {
+    const slot = document.getElementById(toolbarId);
+    const place = slot?.parentElement;
+    if (!slot || !place) return;
+    const header = place.closest('ytd-comments-header-renderer') || place;
+    const count = header.querySelector('#count');
+    const sort = place.querySelector('yt-sort-filter-sub-menu-renderer')
+      || place.closest('yt-sort-filter-sub-menu-renderer');
+    const label = sort?.querySelector('#label') || sort;
+    slot.style.top = '0px';
+    if (sort) {
+      sort.style.position = 'relative';
+      sort.style.top = '0px';
+    }
+    const slotBox = slot.getBoundingClientRect();
+    if (!slotBox.height) return;
+    const countBox = count?.getBoundingClientRect();
+    const labelBox = label?.getBoundingClientRect();
+    const target = countBox?.height
+      ? countBox.top + countBox.height / 2
+      : labelBox?.height ? labelBox.top + labelBox.height / 2 : null;
+    if (target === null) return;
+    if (sort && labelBox?.height) {
+      const sortOffset = target - (labelBox.top + labelBox.height / 2);
+      sort.style.top = sortOffset.toFixed(2) + 'px';
+    }
+    const slotOffset = target - (slotBox.top + slotBox.height / 2);
+    slot.style.top = slotOffset.toFixed(2) + 'px';
+  }
+
+  function toolbarButton(id, label, callback) {
+    const button = document.createElement('button');
+    button.id = id;
+    button.type = 'button';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    button.style.cssText = 'width:36px;height:36px;position:relative;display:inline-flex;align-items:center;justify-content:center;' +
+      'padding:0;border:0;border-radius:50%;background:transparent;cursor:pointer;flex:0 0 auto;line-height:0;vertical-align:middle';
+    button.addEventListener('mouseenter', () => { button.style.backgroundColor = darkTheme() ? '#ffffff1f' : '#0000000f'; });
+    button.addEventListener('mouseleave', () => { button.style.backgroundColor = 'transparent'; });
+    button.addEventListener('click', (event) => { if (event.isTrusted) callback(); });
+    return button;
+  }
+
+  function refreshDownloads() {
+    const button = document.getElementById(downloaderId);
+    if (!button) return;
+    const current = source;
+    const ratio = current?.progress?.ratio || 0;
+    const running = current?.progress?.running;
+    const label = running ? (current.download ? 'Download queued' : 'Download comments when ready') + ' (' + ratio + '%)'
+      : current?.notice || 'Download comments';
+    button.title = label;
+    button.setAttribute('aria-label', label);
+    const ring = button.querySelector('.ytct-progress');
+    if (!ring) return;
+    ring.setAttribute('stroke-dasharray', ratio + ' 100');
+    // A round cap renders a dot for a zero-length dash, so wait for real progress.
+    ring.style.opacity = running && ratio > 0 ? '1' : '0';
+  }
+
+  function refresh() {
+    if (!source?.mounted || !document.body) return;
+    bindVideo();
+    const currentTitle = title();
+    if (source.title !== currentTitle) {
+      source.title = currentTitle;
+      sendAll(stateForPanel());
+    }
+    const place = isMediaSource(source.key) ? anchor() : null;
+    const slot = document.getElementById(toolbarId);
+    const dl = document.getElementById(downloaderId);
+    const open = document.getElementById(openerId);
+    if (!place) {
+      slot?.remove();
+      dl?.remove();
+      open?.remove();
+      return;
+    }
+    if (slot?.parentElement !== place) {
+      slot?.remove();
+      dl?.remove();
+      open?.remove();
+      const bar = document.createElement('span');
+      bar.id = toolbarId;
+      bar.style.cssText = 'display:inline-flex;align-items:center;justify-content:center;gap:2px;flex:0 0 auto;' +
+        'margin-inline-end:4px;line-height:0;vertical-align:middle;position:relative';
+      const downloadButton = toolbarButton(downloaderId, 'Download comments', () => download().catch((error) => {
+        source.notice = error.message;
+        refreshDownloads();
+        sendAll({ event: 'notice', key: source.key, text: error.message });
+      }));
+      const downloadIcon = svg('svg', { viewBox: '0 0 24 24', width: 24, height: 24, 'aria-hidden': true });
+      downloadIcon.append(svg('path', { fill: 'currentColor', d: 'M12 2a1 1 0 00-1 1v11.586l-4.293-4.293a1 1 0 10-1.414 1.414L12 18.414l6.707-6.707a1 1 0 00-1.414-1.414L13 14.586V3a1 1 0 00-1-1Zm7 18H5a1 1 0 000 2h14a1 1 0 000-2Z' }));
+      const ring = svg('svg', { viewBox: '0 0 36 36', width: 36, height: 36, 'aria-hidden': true });
+      ring.setAttribute('class', 'ytct-ring');
+      ring.style.cssText = 'position:absolute;inset:0;transform:rotate(-90deg);pointer-events:none;overflow:visible';
+      const progress = svg('circle', { class: 'ytct-progress', cx: 18, cy: 18, r: 16, pathLength: 100, fill: 'none', 'stroke-width': 2.5, 'stroke-linecap': 'round' });
+      progress.setAttribute('stroke-dasharray', '0 100');
+      progress.style.cssText = 'opacity:0;transition:opacity .2s';
+      ring.append(progress);
+      downloadButton.append(downloadIcon, ring);
+      const opener = toolbarButton(openerId, 'Open comments side panel', () => {
+        if (panels.size) sendAll({ event: 'panel-close' });
+        else worker({ type: 'open-panel' }).catch((error) => { opener.title = error.message; });
+      });
+      const icon = document.createElement('span');
+      icon.setAttribute('aria-hidden', 'true');
+      icon.style.cssText = 'display:block;width:24px;height:24px;background:currentColor;mask:url(' +
+        chrome.runtime.getURL('icons/comments.svg') + ') center / contain no-repeat';
+      opener.append(icon);
+      bar.append(downloadButton, opener);
+      place.insertBefore(bar, place.firstChild);
+    }
+    refreshDownloads();
+    applyToolbarColors();
+    alignToolbar();
+    const header = place.closest('ytd-comments-header-renderer');
+    if (header && typeof ResizeObserver === 'function') {
+      headerObserver?.disconnect();
+      headerObserver = new ResizeObserver(() => alignToolbar());
+      headerObserver.observe(header);
+    }
+    refreshOpener();
+  }
+
+  // ------------------------------------------------------------------ image viewer
+  // Community post images have no close-up view on YouTube. A full-screen button opens a
+  // borderless overlay: click for 1:1, then drag or scroll to pan.
+  const decoratedImages = new WeakSet();
+  let imageViewer = null;
+
+  function originalImageUrl(raw) {
+    try {
+      const url = new URL(raw, location.href);
+      if (!/^https?:$/.test(url.protocol)) return raw;
+      // Google's image CDN keeps its resize/crop directive at the end of the path.
+      const match = /=(?:w\d+-h\d+|s\d+)[^/]*$/.exec(url.pathname);
+      if (match) url.pathname = url.pathname.slice(0, match.index) + '=s0';
+      return url.href;
+    } catch {
+      return raw;
+    }
+  }
+
+  function createImageViewer() {
+    const root = document.createElement('div');
+    root.id = 'ytct-image-viewer';
+    root.setAttribute('role', 'dialog');
+    root.setAttribute('aria-modal', 'true');
+    root.setAttribute('aria-label', 'Image viewer');
+    root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none;overflow:hidden;' +
+      'background:#0b0b0b;touch-action:none;user-select:none;-webkit-user-select:none;cursor:zoom-in';
+    const image = document.createElement('img');
+    image.alt = '';
+    image.decoding = 'async';
+    image.draggable = false;
+    image.hidden = true;
+    image.style.cssText = 'position:absolute;left:0;top:0;display:block;max-width:none;max-height:none;' +
+      'transform-origin:0 0;pointer-events:none;user-select:none;-webkit-user-drag:none;will-change:transform';
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.title = 'Close (Esc)';
+    close.setAttribute('aria-label', 'Close image');
+    close.style.cssText = 'position:absolute;right:14px;top:14px;z-index:1;width:38px;height:38px;display:grid;' +
+      'place-items:center;padding:0;border:0;border-radius:50%;background:#ffffff24;color:#fff;cursor:pointer;' +
+      'opacity:.8;transition:background .15s,opacity .15s';
+    const closeIcon = svg('svg', { viewBox: '0 0 24 24', width: 22, height: 22, 'aria-hidden': true });
+    closeIcon.append(svg('path', { d: 'm6 6 12 12M18 6 6 18', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round' }));
+    close.append(closeIcon);
+    close.addEventListener('mouseenter', () => { close.style.background = '#ffffff3d'; close.style.opacity = '1'; });
+    close.addEventListener('mouseleave', () => { close.style.background = '#ffffff24'; close.style.opacity = '.8'; });
+    close.addEventListener('click', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      closeViewer();
+    });
+    root.append(image, close);
+    document.documentElement.append(root);
+
+    const state = { open: false, width: 0, height: 0, fit: 1, scale: 1, x: 0, y: 0, drag: null, previousOverflow: '' };
+    const zoomed = () => state.scale > state.fit + 0.001;
+
+    function stage() {
+      return { width: root.clientWidth, height: root.clientHeight };
+    }
+
+    function applyTransform() {
+      image.style.transform = 'translate(' + state.x + 'px,' + state.y + 'px) scale(' + state.scale + ')';
+    }
+
+    function clampPan() {
+      const box = stage();
+      const width = state.width * state.scale;
+      const height = state.height * state.scale;
+      state.x = width <= box.width ? (box.width - width) / 2 : Math.min(0, Math.max(box.width - width, state.x));
+      state.y = height <= box.height ? (box.height - height) / 2 : Math.min(0, Math.max(box.height - height, state.y));
+    }
+
+    function fitView() {
+      const box = stage();
+      state.fit = Math.min(box.width / state.width, box.height / state.height, 1) || 1;
+      state.scale = state.fit;
+      state.x = (box.width - state.width * state.fit) / 2;
+      state.y = (box.height - state.height * state.fit) / 2;
+      root.style.cursor = 'zoom-in';
+      applyTransform();
+    }
+
+    function toggleZoom(clientX, clientY) {
+      if (!state.width) return;
+      if (zoomed()) {
+        fitView();
+        return;
+      }
+      const box = stage();
+      const x = clientX ?? box.width / 2;
+      const y = clientY ?? box.height / 2;
+      // Keep the clicked image point under the cursor while scaling to 1:1.
+      state.x = x - (x - state.x) / state.scale;
+      state.y = y - (y - state.y) / state.scale;
+      state.scale = 1;
+      clampPan();
+      root.style.cursor = 'grab';
+      applyTransform();
+    }
+
+    function closeViewer() {
+      state.open = false;
+      state.drag = null;
+      image.hidden = true;
+      image.removeAttribute('src');
+      root.style.display = 'none';
+      document.documentElement.style.overflow = state.previousOverflow || '';
+      document.removeEventListener('keydown', onKey, true);
+    }
+
+    function onKey(event) {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      event.stopPropagation();
+      closeViewer();
+    }
+
+    function open(url, fallback) {
+      if (!url) return;
+      if (!state.open) state.previousOverflow = document.documentElement.style.overflow;
+      state.open = true;
+      state.width = 0;
+      state.height = 0;
+      state.fit = 1;
+      state.scale = 1;
+      state.x = 0;
+      state.y = 0;
+      image.hidden = true;
+      image.style.width = '0px';
+      image.style.height = '0px';
+      image.dataset.fallback = fallback && fallback !== url ? fallback : '';
+      root.style.display = 'block';
+      root.style.cursor = 'zoom-in';
+      document.documentElement.style.overflow = 'hidden';
+      image.src = url;
+      document.addEventListener('keydown', onKey, true);
+    }
+
+    image.addEventListener('load', () => {
+      if (!state.open || !image.naturalWidth) return;
+      state.width = image.naturalWidth;
+      state.height = image.naturalHeight;
+      image.style.width = state.width + 'px';
+      image.style.height = state.height + 'px';
+      image.hidden = false;
+      fitView();
+    });
+    image.addEventListener('error', () => {
+      if (!state.open) return;
+      const fallback = image.dataset.fallback;
+      if (fallback) {
+        image.dataset.fallback = '';
+        image.src = fallback;
+        return;
+      }
+      closeViewer();
+    });
+
+    root.addEventListener('pointerdown', (event) => {
+      if (event.button !== 0 || event.target === close || close.contains(event.target)) return;
+      state.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: state.x, top: state.y, moved: false };
+      try { root.setPointerCapture(event.pointerId); } catch {}
+      root.style.cursor = 'grabbing';
+    });
+    root.addEventListener('pointermove', (event) => {
+      const drag = state.drag;
+      if (!drag || drag.id !== event.pointerId) return;
+      const dx = event.clientX - drag.x;
+      const dy = event.clientY - drag.y;
+      if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+      if (!drag.moved) return;
+      state.x = drag.left + dx;
+      state.y = drag.top + dy;
+      clampPan();
+      applyTransform();
+    });
+    function endDrag(event) {
+      const drag = state.drag;
+      if (!drag || (event && event.pointerId !== drag.id)) return;
+      state.drag = null;
+      try { root.releasePointerCapture(drag.id); } catch {}
+      root.style.cursor = zoomed() ? 'grab' : 'zoom-in';
+      if (event && event.type === 'pointerup' && !drag.moved) toggleZoom(event.clientX, event.clientY);
+    }
+    root.addEventListener('pointerup', endDrag);
+    root.addEventListener('pointercancel', endDrag);
+    root.addEventListener('wheel', (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (!state.open) return;
+      const step = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? root.clientHeight : 1;
+      state.x -= (event.shiftKey ? event.deltaY : event.deltaX) * step;
+      state.y -= (event.shiftKey ? 0 : event.deltaY) * step;
+      clampPan();
+      applyTransform();
+    }, { passive: false });
+    window.addEventListener('resize', () => {
+      if (!state.open || !state.width) return;
+      if (zoomed()) { clampPan(); applyTransform(); }
+      else fitView();
+    });
+
+    return { open, close: closeViewer };
+  }
+
+  function openImageViewer(url, fallback) {
+    imageViewer ||= createImageViewer();
+    imageViewer.open(url, fallback);
+  }
+
+  function decoratePostImages() {
+    for (const image of document.querySelectorAll('ytd-backstage-image-renderer img:not([data-ytct-image])')) {
+      if (decoratedImages.has(image)) continue;
+      const host = image.closest('ytd-backstage-image-renderer') || image.parentElement;
+      if (!host || host.querySelector(':scope > .ytct-image-button')) continue;
+      decoratedImages.add(image);
+      image.dataset.ytctImage = '1';
+      if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+      const trigger = document.createElement('button');
+      trigger.type = 'button';
+      trigger.className = 'ytct-image-button';
+      trigger.title = 'View image full screen';
+      trigger.setAttribute('aria-label', 'View image full screen');
+      trigger.style.cssText = 'position:absolute;right:8px;bottom:8px;z-index:2;width:34px;height:34px;display:grid;' +
+        'place-items:center;padding:0;border:0;border-radius:8px;background:#0000009e;color:#fff;cursor:zoom-in;' +
+        'opacity:.9;transition:background .15s,opacity .15s;box-shadow:0 1px 4px #00000059';
+      const icon = svg('svg', { viewBox: '0 0 24 24', width: 20, height: 20, 'aria-hidden': true });
+      icon.append(svg('path', { d: 'M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }));
+      trigger.append(icon);
+      trigger.addEventListener('mouseenter', () => { trigger.style.background = '#000000c9'; trigger.style.opacity = '1'; });
+      trigger.addEventListener('mouseleave', () => { trigger.style.background = '#0000009e'; trigger.style.opacity = '.9'; });
+      trigger.addEventListener('pointerdown', (event) => event.stopPropagation());
+      trigger.addEventListener('click', (event) => {
+        if (!event.isTrusted) return;
+        event.preventDefault();
+        event.stopPropagation();
+        const current = host.querySelector('img') || image;
+        const src = current.currentSrc || current.src;
+        if (src) openImageViewer(originalImageUrl(src), src);
+      });
+      host.append(trigger);
+    }
+  }
+
+  function scheduleMount() {
+    if (mountTimer) return;
+    mountTimer = setTimeout(() => {
+      mountTimer = null;
+      scanSource();
+      refresh();
+      decoratePostImages();
+    }, 250);
+  }
+
+  window.addEventListener('message', (event) => {
+    const message = event.data;
+    if (event.source !== window || event.origin !== location.origin || message?.channel !== 'ytct-page-result'
+      || message.key !== source?.key || sourceKey(location.href) !== source.key) return;
+    if (message.event === 'progress' && message.progress && typeof message.progress.running === 'boolean') {
+      source.progress = message.progress;
+      refreshDownloads();
+      sendAll(stateForPanel());
+      if (source.waitingForTokens && message.progress.count > 0 && !source.job) {
+        source.waitingForTokens = false;
+        source.retried = true;
+        collect(source, { background: true }).catch(() => {});
+      }
+      return;
+    }
+    const request = pending.get(message.id);
+    if (!request || request.key !== message.key) return;
+    clearTimeout(request.timer);
+    pending.delete(message.id);
+    if (message.error) request.reject(new Error(message.error));
+    else request.resolve(message.value);
+  });
+
+  chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== 'ytct-tab' || port.sender?.id !== chrome.runtime.id) return;
+    panels.add(port);
+    port.postMessage(stateForPanel());
+    bindVideo();
+    refreshOpener();
+    ensureTheater();
+    if (!mediaTimer) mediaTimer = setInterval(bindVideo, 1300);
+    port.onDisconnect.addListener(() => {
+      panels.delete(port);
+      bindVideo();
+      refreshOpener();
+      if (!panels.size) {
+        restoreTheater();
+        clearInterval(mediaTimer);
+        mediaTimer = null;
+      }
+    });
+    port.onMessage.addListener((message) => {
+      const current = source;
+      if (!current || message.key !== current.key || typeof message.id !== 'string') return;
+      async function handle() {
+        if (message.action === 'seek') return seek(message.seconds);
+        if (message.action === 'load') return readCache(current);
+        if (message.action === 'collect') return collect(current, { background: !message.force, force: !!message.force, fresh: !!message.fresh });
+        if (message.action === 'stop' || message.action === 'transcript') return page(message.action, current);
+        throw new Error('Unsupported panel action.');
+      }
+      const respond = (reply) => {
+        try { port.postMessage({ id: message.id, key: current.key, pageId: current.pageId, ...reply }); } catch {}
+      };
+      handle().then((value) => respond({ value }), (error) => respond({ error: error.message }));
+    });
+  });
+
+  function start() {
+    scanSource();
+    refresh();
+    decoratePostImages();
+    new MutationObserver(scheduleMount).observe(document.documentElement, { subtree: true, childList: true });
+    new MutationObserver(() => { applyToolbarColors(); sendAll(stateForPanel()); }).observe(document.documentElement, { attributes: true, attributeFilter: ['dark'] });
+  }
+  for (const event of ['yt-navigate-finish', 'yt-page-data-updated']) document.addEventListener(event, () => {
+    scanSource();
+    scheduleMount();
+    sendAll(stateForPanel());
+  });
+  window.addEventListener('load', () => scheduleCollection(scanSource()), { once: true });
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
+  else start();
+})();

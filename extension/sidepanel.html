@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>YouTube Comments</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header class="header">
+    <div class="heading">
+      <h1>Comments <span id="count"></span></h1>
+      <p id="source-title">Open a YouTube video or post</p>
+    </div>
+    <button id="open-settings" class="icon" type="button" title="Settings" aria-label="Settings" aria-controls="settings" aria-expanded="false">
+      <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M19.1 13a7 7 0 0 0 0-2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-1.7-1l-.4-2.5h-4l-.4 2.5a7 7 0 0 0-1.7 1l-2.4-1-2 3.4L6 11a7 7 0 0 0 0 2l-1.9 1.6 2 3.4 2.4-1a7 7 0 0 0 1.7 1l.4 2.5h4l.4-2.5a7 7 0 0 0 1.7-1l2.4 1 2-3.4L19.1 13Z"/><circle cx="12.6" cy="12" r="2.6"/></svg>
+    </button>
+  </header>
+
+  <div id="video-tools" class="video-tools" hidden>
+    <label class="check"><input id="timestamp-only" type="checkbox"> Timestamped only</label>
+    <button id="follow" class="pill" type="button" aria-pressed="false" disabled>Sync to video time</button>
+  </div>
+  <div id="notice" role="status" class="notice" hidden></div>
+  <div id="collection" class="collection" hidden>
+    <span id="collection-status" role="status"></span>
+    <button id="collect" class="pill" type="button">Collect</button>
+  </div>
+  <main id="comments" aria-label="Comments and replies" tabindex="0"></main>
+
+  <section id="ai" class="ask" aria-label="Ask Gemma" hidden>
+    <div id="ai-resize" class="ask-resize" role="separator" aria-orientation="horizontal"
+      aria-label="Resize Ask Gemma" aria-valuemin="110" tabindex="0" title="Drag to resize"></div>
+    <div class="ask-bar">
+      <h2 id="ai-heading">Ask Gemma</h2>
+      <span id="ai-status" role="status">Ready</span>
+    </div>
+    <div id="ai-cost" class="ai-cost" hidden></div>
+    <div id="telemetry" class="telemetry" hidden></div>
+    <div id="chat" class="chat" role="log" tabindex="0" aria-label="Chat"></div>
+    <div id="confirm" class="confirm" hidden>
+      <p id="confirm-description"></p>
+      <button id="confirm-load" class="pill primary" type="button">Load anyway</button>
+      <button id="cancel-load" class="pill" type="button">Cancel</button>
+    </div>
+  </section>
+
+  <footer>
+    <div class="modes" role="group" aria-label="Input mode">
+      <button id="search-mode" type="button" aria-pressed="true">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.8" cy="10.8" r="6.6"/><path d="m16 16 4.5 4.5"/></svg>
+        Search
+      </button>
+      <button id="ai-mode" type="button" aria-pressed="false" aria-label="Ask Gemma">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M13 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v4l4-4h6a2 2 0 0 0 2-2v-3M7 8h5m-5 4h8"/><path class="spark" d="m19 2 1.2 3.3L23.5 6.5l-3.3 1.2L19 11l-1.2-3.3L14.5 6.5l3.3-1.2L19 2z"/></svg>
+        <span id="ai-mode-label">Ask Gemma</span>
+      </button>
+    </div>
+    <form id="composer">
+      <input id="query" type="search" placeholder="Search comments" aria-label="Search comments" autocomplete="off">
+      <button id="send" type="submit" class="pill primary" hidden disabled>Ask</button>
+    </form>
+  </footer>
+
+  <dialog id="settings" aria-labelledby="settings-title">
+    <form id="settings-form">
+      <header class="settings-head">
+        <h2 id="settings-title">Settings</h2>
+        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+          <button id="settings-tab-general" class="settings-tab" type="button" role="tab"
+            aria-selected="true" aria-controls="settings-general" tabindex="0">General</button>
+          <button id="settings-tab-llm" class="settings-tab" type="button" role="tab"
+            aria-selected="false" aria-controls="settings-llm" tabindex="-1">LLM</button>
+        </div>
+        <button id="close-settings" type="button" class="icon" aria-label="Close settings">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18"/></svg>
+        </button>
+      </header>
+
+      <div id="settings-general" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-general">
+        <fieldset>
+          <legend>Comments</legend>
+          <label>Replies per click <input name="replyBatch" type="number" min="1" max="10000" required></label>
+          <label>Load all replies <input name="allReplies" type="checkbox"></label>
+          <label>Text scale
+            <span class="range">
+              <input id="font-scale" name="fontScale" type="range" min="70" max="160" step="5">
+              <output id="font-scale-value" for="font-scale">100%</output>
+            </span>
+          </label>
+          <label>Highlight offset (seconds) <input name="highlightOffset" type="number" required></label>
+          <label>Highlight duration (seconds) <input name="highlightDuration" type="number" min="0" max="120" required></label>
+          <label>Stack window (seconds) <input name="stackWindow" type="number" min="0" max="60" required></label>
+          <p class="hint">Negative offsets highlight before the timestamp. A duration of 0 keeps a comment highlighted until the next timestamp. Comments whose timestamps fall within the stack window are grouped.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Assistant</legend>
+          <label>Include video transcript <input name="includeTranscript" type="checkbox"></label>
+          <label>Context window (tokens) <input name="contextWindow" type="number" min="1024" max="262144" required></label>
+          <label>Show model telemetry <input name="debugOllama" type="checkbox"></label>
+        </fieldset>
+        <fieldset>
+          <legend>Exports</legend>
+          <label>Download format <select name="format"><option value="markdown">Markdown</option><option value="json">JSON</option></select></label>
+          <label>Keep exports (days) <input name="cacheDays" type="number" min="1" max="3650" required></label>
+          <label>Unused exports (hours after leaving) <input name="unusedCacheHours" type="number" min="1" max="8760" required></label>
+          <label>Cache limit (MB) <input name="cacheMB" type="number" min="1" max="1000" required></label>
+          <p id="cache-usage" class="hint" role="status"></p>
+          <button type="button" id="import-export" class="pill">Open Markdown or JSON export</button>
+          <button type="button" id="collect-fresh" class="pill">Collect fresh comments</button>
+          <input id="import-file" type="file" accept=".md,.markdown,.json" hidden>
+        </fieldset>
+        <p id="settings-error" class="settings-error" role="status" hidden></p>
+        <button type="submit" class="pill primary save-settings">Save settings</button>
+      </div>
+    </form>
+
+    <div id="settings-llm" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-llm" hidden>
+        <p class="hint">API keys stay in this extension’s local background storage, masked unless you reveal or copy one. Anyone who can read this browser profile’s extension storage can read them; keep provider-side spending limits. See the README for the threat model.</p>
+        <div class="llm-top">
+          <label>Active profile <select id="llm-profile-select"></select></label>
+          <div class="button-row">
+            <button type="button" id="llm-new" class="pill" title="New profile">New</button>
+            <button type="button" id="llm-delete" class="pill" title="Delete active profile">Delete</button>
+            <button type="button" id="llm-test" class="pill" title="Test connection">Test</button>
+            <button type="button" id="llm-save" class="pill primary" title="Save LLM settings">Save</button>
+          </div>
+          <p id="llm-status" class="hint" role="status"></p>
+          <div id="llm-grant" class="llm-grant" hidden>
+            <p id="llm-grant-text"></p>
+            <button type="button" id="llm-grant-button" class="pill primary">Grant network access</button>
+          </div>
+        </div>
+
+        <fieldset>
+          <legend id="llm-form-title">New profile</legend>
+          <label>Profile name <input id="llm-label" maxlength="60" autocomplete="off" placeholder="My local model"></label>
+          <label>Provider
+            <select id="llm-provider">
+              <option value="ollama">Ollama (local)</option>
+              <option value="cloud">Custom OpenAI-compatible</option>
+            </select>
+          </label>
+          <p id="llm-provider-hint" class="hint"></p>
+          <label>Base URL <input id="llm-endpoint" type="text" maxlength="400" autocomplete="off" spellcheck="false" placeholder="https://api.example.com/v1"></label>
+          <label>Model
+            <span class="model-row">
+              <input id="llm-model" maxlength="160" autocomplete="off" spellcheck="false" list="llm-model-options" placeholder="model-id">
+              <button type="button" id="llm-load-models" class="pill">Load models</button>
+            </span>
+          </label>
+          <datalist id="llm-model-options"></datalist>
+          <p id="llm-model-status" class="hint" role="status"></p>
+          <label>API key <input id="llm-key" type="password" maxlength="4096" autocomplete="new-password" placeholder="Optional for local servers"></label>
+          <div class="key-actions">
+            <span id="llm-key-mask" class="hint">No saved key</span>
+            <button type="button" id="llm-reveal" class="pill">Reveal</button>
+            <button type="button" id="llm-copy" class="pill">Copy</button>
+            <button type="button" id="llm-clear-key" class="pill">Clear key</button>
+          </div>
+          <code id="llm-key-value" class="key-value" hidden></code>
+          <a id="llm-signup" class="hint" target="_blank" rel="noopener noreferrer" hidden>Get an API key</a>
+          <label>Thinking level
+            <select id="llm-thinking">
+              <option value="default">Default (model setting)</option>
+              <option value="off">Off</option>
+              <option value="low">Low</option>
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+            </select>
+          </label>
+          <p id="llm-endpoint-hint" class="hint"></p>
+        </fieldset>
+
+        <fieldset id="llm-pricing" hidden>
+          <legend>Cloud pricing</legend>
+          <label>Input price (USD / 1M tokens) <input id="llm-input-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+          <label>Output price (USD / 1M tokens) <input id="llm-output-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+          <p class="hint">Only used for the cost estimate shown under Ask. Leave at 0 to skip cost.</p>
+        </fieldset>
+
+        <fieldset>
+          <legend>Assistant name</legend>
+          <label>Name <input id="llm-assistant-name" maxlength="32" autocomplete="off" placeholder="Gemma"></label>
+          <p class="hint">Used by the Ask button and heading. Leave blank to derive it from the model.</p>
+        </fieldset>
+    </div>
+  </dialog>
+
+  <script src="common.js"></script>
+  <script src="vendor/markdown-it.min.js"></script>
+  <script type="module" src="sidepanel.mjs"></script>
+</body>
+</html>
