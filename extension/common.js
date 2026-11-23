@@ -5,7 +5,7 @@ globalThis.YTCT = (() => {
   const maxEntryBytes = 8 * 1024 * 1024;
 
   const settingsDefaults = Object.freeze({
-    format: 'markdown', shareTranscript: false, contextWindow: 32768, debugOllama: false, cacheEnabled: false,
+    format: 'markdown', shareTranscript: false, autoCollect: false, contextWindow: 32768, debugOllama: false, cacheEnabled: false,
     cacheDays: 7, cacheMB: 100, unusedCacheHours: 24, highlightOffset: -3, replyBatch: 10, allReplies: false,
     fontScale: 100, highlightDuration: 6, stackWindow: 3,
   });

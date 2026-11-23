@@ -74,6 +74,7 @@ function normalizeSettings(raw = {}) {
   return {
     format: s.format === 'json' ? 'json' : 'markdown',
     shareTranscript: s.shareTranscript === true,
+    autoCollect: s.autoCollect === true,
     cacheEnabled: s.cacheEnabled === true,
     debugOllama: !!s.debugOllama,
     contextWindow: bounded(s.contextWindow, 32768, 1024, 262144),
@@ -142,6 +143,7 @@ async function setVisit(tabId, key, pageId = '') {
   await chrome.storage.session.set({ visits });
   if (prior && (prior.pageId !== pageId || prior.key !== key)) await chrome.storage.session.remove('chat:' + tabId);
   await persistCache(index, removed);
+  return { autoCollect: settings.autoCollect === true && isMediaSource(key) };
 }
 
 async function cacheAction(message, tabId) {
@@ -264,8 +266,7 @@ async function handle(message, sender) {
         const key = sourceKey(tab.url || sender.url);
         if (!key || tab.incognito || message.key !== key) throw new Error('The page changed.');
         await chrome.sidePanel.setOptions({ tabId, path: panelPath(tabId), enabled: isMediaSource(key) });
-        await setVisit(tabId, key, message.pageId);
-        return true;
+        return await setVisit(tabId, key, message.pageId);
       });
     }
     case 'read-cache':

@@ -50,6 +50,12 @@
       };
       refreshDownloads();
       sendAll(stateForPanel());
+      if (source.waitingForTokens && source.autoCollect && !source.stopped && !source.export && !source.job
+        && message.progress.count > 0 && document.visibilityState === 'visible') {
+        source.waitingForTokens = false;
+        source.retried = true;
+        collect(source, { background: true }).catch(() => {});
+      }
       return;
     }
     const request = pending.get(message.id);
@@ -222,12 +228,13 @@
     if (source?.key === key) return source;
     clearTimeout(mountTimer);
     mountTimer = null;
+    clearTimeout(source?.scheduleTimer);
     for (const request of pending.values()) {
       clearTimeout(request.timer);
       request.reject(new Error('YouTube source changed.'));
     }
     pending.clear();
-    const current = source = { key, pageId: documentId + ':' + ++counter, progress: {}, mounted: false };
+    const current = source = { key, pageId: documentId + ':' + ++counter, progress: {}, mounted: false, autoCollect: false };
     async function bindVisit() {
       for (let attempt = 0; source === current; attempt++) {
         try { return await worker({ type: 'visit', key, pageId: current.pageId }); }
@@ -237,11 +244,13 @@
         }
       }
     }
-    current.bound = bindVisit().then(() => {
+    current.bound = bindVisit().then((binding) => {
       if (source === current) {
         current.mounted = true;
+        current.autoCollect = binding?.autoCollect === true;
         refresh();
         sendAll(stateForPanel());
+        scheduleCollection(current);
         if (panels.size) ensureTheater();
       }
     });
@@ -256,8 +265,37 @@
     return current;
   }
 
-  function collect(current, { fresh = false } = {}) {
+  function scheduleCollection(current) {
+    if (!current?.mounted || !current.autoCollect || current.scheduled || current.export || current.job || current.stopped
+      || !isMediaSource(current.key) || document.readyState !== 'complete' || document.visibilityState !== 'visible') return;
+    current.scheduled = true;
+    const measure = () => {
+      const element = document.querySelector(current.key.startsWith('video:') ? '#movie_player' : 'ytd-post-renderer');
+      return element ? element.offsetWidth + 'x' + element.offsetHeight : '';
+    };
+    const size = measure();
+    current.scheduleTimer = setTimeout(() => {
+      current.scheduleTimer = null;
+      if (source !== current || current.stopped || current.export || current.job) return;
+      if (document.visibilityState !== 'visible') {
+        current.scheduled = false;
+        return;
+      }
+      if (measure() !== size && (current.measureChecks || 0) < 8) {
+        current.measureChecks = (current.measureChecks || 0) + 1;
+        current.scheduled = false;
+        scheduleCollection(current);
+      } else collect(current, { background: true }).catch(() => {});
+    }, 3200);
+  }
+
+  function collect(current, { background = false, fresh = false } = {}) {
     if (current.job) return current.job;
+    if (!background) {
+      current.stopped = false;
+      clearTimeout(current.scheduleTimer);
+      current.scheduleTimer = null;
+    }
     const action = async () => {
       if (source !== current) return null;
       await current.bound;
@@ -265,10 +303,16 @@
       current.progress = { running: true, ratio: 0 };
       refreshDownloads();
       sendAll(stateForPanel());
-      const { snapshot, result } = await page('collect', current, { fresh });
+      const { snapshot, result } = await page('collect', current, { background, fresh });
       if (source !== current) return null;
       if (!snapshot) {
         if (result?.status === 'stopped') return null;
+        if (background && !current.retried) {
+          // Some videos only expose the first continuation after their comment section initializes.
+          current.waitingForTokens = true;
+          current.progress = {};
+          return null;
+        }
         throw new Error(result?.reason || 'YouTube returned no comments.');
       }
       if (!snapshot.metadata || !Array.isArray(snapshot.comments)
@@ -283,7 +327,14 @@
     };
     const locks = window.navigator?.locks;
     current.job = (locks ? locks.request('ytct-extension:' + current.key, action) : action()).catch((error) => {
-      if (source === current) current.progress = { ...current.progress, running: false, status: 'error', reason: error.message };
+      if (source === current) {
+        if (background && !current.retried && /no comment tokens found/i.test(error.message)) {
+          current.waitingForTokens = true;
+          current.progress = {};
+        } else {
+          current.progress = { ...current.progress, running: false, status: 'error', reason: error.message };
+        }
+      }
       throw error;
     }).finally(() => {
       current.job = null;
@@ -802,7 +853,12 @@
         if (message.action === 'seek') return seek(message.seconds);
         if (message.action === 'load-collected') return current.export || null;
         if (message.action === 'collect') return collect(current, { fresh: !!message.fresh });
-        if (message.action === 'stop') return page('stop', current);
+        if (message.action === 'stop') {
+          current.stopped = true;
+          clearTimeout(current.scheduleTimer);
+          current.scheduleTimer = null;
+          return page('stop', current);
+        }
         if (message.action === 'transcript') {
           const value = await page('transcript', current);
           if (value?.ok === true && typeof value.text === 'string' && value.text.length <= 512 * 1024) {
@@ -827,9 +883,14 @@
     new MutationObserver(() => { applyToolbarColors(); sendAll(stateForPanel()); }).observe(document.documentElement, { attributes: true, attributeFilter: ['dark'] });
   }
   for (const event of ['yt-navigate-finish', 'yt-page-data-updated']) document.addEventListener(event, () => {
-    scanSource();
+    const current = scanSource();
     scheduleMount();
+    scheduleCollection(current);
     sendAll(stateForPanel());
+  });
+  window.addEventListener('load', () => scheduleCollection(scanSource()), { once: true });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') scheduleCollection(source);
   });
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start, { once: true });
   else start();
