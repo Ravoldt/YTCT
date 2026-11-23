@@ -74,6 +74,36 @@ export async function unloadModel(model, relay) {
   await boundedJson(response, 65536);
 }
 
+export function parseOllamaShow(data) {
+  let contextLength = 0;
+  if (data?.model_info && typeof data.model_info === 'object') {
+    for (const [key, value] of Object.entries(data.model_info)) {
+      if (key.endsWith('.context_length') && Number.isFinite(Number(value)) && Number(value) >= 1024) {
+        contextLength = Math.max(contextLength, Math.floor(Number(value)));
+      }
+    }
+  }
+  if (!contextLength && typeof data?.parameters === 'string') {
+    const match = /\bnum_ctx\s+(\d+)/i.exec(data.parameters);
+    if (match && Number(match[1]) >= 1024) contextLength = Math.floor(Number(match[1]));
+  }
+  let thinking = null;
+  if (Array.isArray(data?.capabilities)) {
+    const supported = data.capabilities.includes('thinking');
+    thinking = supported
+      ? { supported: true, levels: ['default', 'off', 'on', 'low', 'medium', 'high'] }
+      : { supported: false, levels: ['default'] };
+  }
+  return { contextLength, thinking };
+}
+
+export async function showModel(model, relay) {
+  if (!model) return { contextLength: 0, thinking: null };
+  const response = await request('/api/show', { model }, AbortSignal.timeout(10000), relay);
+  const data = await boundedJson(response, 1024 * 1024);
+  return parseOllamaShow(data);
+}
+
 export async function readChatStream(response, update, signal) {
   if (!response.body) throw new Error('Ollama returned an empty response.');
   const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
@@ -124,7 +154,9 @@ export async function askOllama(session, history, question, settings, onChange, 
 } = {}) {
   if (!model) throw new Error('Select an Ollama model in Settings → LLM.');
   let budgetScale = 1;
-  let think = thinking === 'default' ? undefined : thinking === 'off' ? false : thinking;
+  let think = thinking === 'default' ? undefined
+    : thinking === 'off' ? false
+      : thinking === 'on' ? true : thinking;
   let triedThinkFallback = false;
   let retryWithoutThinking = false;
   const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(15 * 60000)]);

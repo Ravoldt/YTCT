@@ -1,6 +1,5 @@
-const { commentTimestamps, parseLikes, timelineFor, activeTimestamp, sidebarPreview, sourceLink } = YTCT;
+const { commentTimestamps, parseLikes, timelineFor, activeTimestamps, sidebarPreview, sourceLink, formatDuration } = YTCT;
 const PAGE_SIZE = 45;
-const SCROLL_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', ' ']);
 
 export function commentThreads(records) {
   const byId = new Map(records.map((record) => [record.id, record]));
@@ -87,14 +86,29 @@ function likesOf(thread) {
   return parseLikes(thread.root?.likes ?? thread.likes);
 }
 
+function exceedsClampLines(node) {
+  if (!node || !node.clientHeight) return true;
+  if (typeof getComputedStyle !== 'function') return true;
+  const style = getComputedStyle(node);
+  let lineHeight = parseFloat(style.lineHeight);
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0) {
+    const fontSize = parseFloat(style.fontSize) || 14;
+    lineHeight = fontSize * 1.45;
+  }
+  return node.scrollHeight > lineHeight * 4 + 2;
+}
+
 export class CommentsView {
-  constructor({ list, count, follow, timestampOnly, seek }) {
-    Object.assign(this, { list, count, follow, timestampOnly, seek });
+  constructor({ list, count, follow, timestampOnly, playhead = null, seek }) {
+    Object.assign(this, { list, count, follow, timestampOnly, playhead, seek });
     this.settings = YTCT.settingsDefaults;
+    this.lastWidth = 0;
+    this.resizeFrame = 0;
     this.reset('');
     // Timestamp-only mode is the one place playback following is on by default.
     timestampOnly.addEventListener('change', () => {
       this.setFollow(timestampOnly.checked);
+      this.updatePlayhead();
       this.filter();
     });
     follow.addEventListener('click', () => {
@@ -103,32 +117,61 @@ export class CommentsView {
       this.tick(this.media, true);
     });
     this.breakSyncOnScroll();
+    this.watchResize();
   }
 
-  // Only the user's own scrolling stops the sync; seek-driven scrollIntoView calls do not.
-  breakSyncOnScroll() {
-    const stop = () => {
-      if (this.following) this.setFollow(false);
+  watchResize() {
+    const schedule = () => {
+      const width = this.list.clientWidth;
+      if (!width || width === this.lastWidth) return;
+      this.lastWidth = width;
+      if (typeof requestAnimationFrame === 'function') {
+        if (this.resizeFrame) cancelAnimationFrame(this.resizeFrame);
+        this.resizeFrame = requestAnimationFrame(() => {
+          this.resizeFrame = 0;
+          if (this.nodes?.size) this.syncReadMore();
+        });
+      } else if (this.nodes?.size) {
+        this.syncReadMore();
+      }
     };
-    this.list.addEventListener('wheel', stop, { passive: true });
-    this.list.addEventListener('touchmove', stop, { passive: true });
+    if (typeof ResizeObserver === 'function') {
+      this.resizeObserver = new ResizeObserver(schedule);
+      this.resizeObserver.observe(this.list);
+    }
+    if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+      window.addEventListener('resize', schedule, { passive: true });
+    }
+  }
+
+  // Only break sync when the user scrolls the last highlighted comment completely off-screen.
+  breakSyncOnScroll() {
     this.list.addEventListener('scroll', () => {
+      if (!this.following) return;
       if (performance.now() < (this.scrollGuard || 0)) return;
       if (this.expectedScrollTop !== null && Math.abs(this.list.scrollTop - this.expectedScrollTop) <= 2) {
         this.expectedScrollTop = null;
         return;
       }
-      stop();
+      if (this.lastHighlightedId && !this.isVisibleInList(this.lastHighlightedId)) {
+        this.setFollow(false);
+      }
     }, { passive: true });
-    this.list.addEventListener('keydown', (event) => {
-      if (SCROLL_KEYS.has(event.key)) stop();
-    });
-    this.list.addEventListener('pointerdown', (event) => {
-      const box = this.list.getBoundingClientRect();
-      const onScrollbar = event.clientX - box.left >= this.list.clientWidth
-        || event.clientY - box.top >= this.list.clientHeight;
-      if (onScrollbar) stop();
-    });
+  }
+
+  isVisibleInList(id) {
+    const row = this.nodes.get(id);
+    if (!row) return false;
+    const listRect = this.list.getBoundingClientRect();
+    const itemRect = row.element.getBoundingClientRect();
+    return itemRect.bottom > listRect.top && itemRect.top < listRect.bottom;
+  }
+
+  updatePlayhead() {
+    if (!this.playhead) return;
+    const show = this.timestampOnly.checked && !!this.media && Number.isFinite(this.media.currentTime);
+    this.playhead.hidden = !show;
+    if (show) this.playhead.textContent = formatDuration(this.media.currentTime);
   }
 
   holdScroll() {
@@ -160,16 +203,18 @@ export class CommentsView {
   }
 
   reset(key) {
+    this.activeTimers ||= new Map();
     this.clearHighlight();
     Object.assign(this, { key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [], syncTimeline: [],
-      query: '', media: null, active: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE, entry: null,
-      scrollGuard: 0, expectedScrollTop: null });
+      query: '', media: null, active: new Map(), lastHighlightedId: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE,
+      entry: null, scrollGuard: 0, expectedScrollTop: null });
     this.expanded = new Map();
     this.expandedStacks = new Set();
     this.full = new Set();
     this.nodes = new Map();
     this.timestampOnly.checked = false;
     this.setFollow(false);
+    this.updatePlayhead();
     this.follow.disabled = true;
     this.setScale(this.settings.fontScale);
     this.count.textContent = '';
@@ -206,8 +251,9 @@ export class CommentsView {
     const previous = this.settings;
     this.settings = settings;
     this.setScale(settings.fontScale);
-    if (this.timestampOnly.checked && previous.stackWindow !== settings.stackWindow) this.filter();
-    else {
+    if (this.timestampOnly.checked && (previous.stackComments !== settings.stackComments || previous.stackWindow !== settings.stackWindow)) {
+      this.filter();
+    } else {
       this.render();
       this.tick(this.media, true);
     }
@@ -232,10 +278,12 @@ export class CommentsView {
   }
 
   clearHighlight() {
-    clearTimeout(this.highlightTimer);
-    this.highlightTimer = null;
-    this.group = null;
-    this.active = null;
+    if (this.activeTimers) {
+      for (const timer of this.activeTimers.values()) clearTimeout(timer);
+      this.activeTimers.clear();
+    }
+    this.active = new Map();
+    this.lastHighlightedId = null;
   }
 
   filter() {
@@ -276,29 +324,33 @@ export class CommentsView {
       entries.sort((a, b) => a.seconds - b.seconds
         || likesOf(b.thread) - likesOf(a.thread)
         || String(a.thread.root.id).localeCompare(String(b.thread.root.id)));
-      const windowSeconds = Math.max(0, Number(this.settings.stackWindow) || 0);
-      const groups = [];
-      for (const entry of entries) {
-        if (!entry.stackable) {
-          groups.push(entry);
-          continue;
+      if (this.settings.stackComments === false) {
+        this.visible = entries.map((entry) => ({ kind: 'thread', thread: entry.thread }));
+      } else {
+        const windowSeconds = Math.max(0, Number(this.settings.stackWindow) || 0);
+        const groups = [];
+        for (const entry of entries) {
+          if (!entry.stackable) {
+            groups.push(entry);
+            continue;
+          }
+          const last = groups[groups.length - 1];
+          if (last?.kind === 'stack' && entry.seconds - last.anchor <= windowSeconds) last.threads.push(entry.thread);
+          else groups.push({ kind: 'stack', anchor: entry.seconds, threads: [entry.thread] });
         }
-        const last = groups[groups.length - 1];
-        if (last?.kind === 'stack' && entry.seconds - last.anchor <= windowSeconds) last.threads.push(entry.thread);
-        else groups.push({ kind: 'stack', anchor: entry.seconds, threads: [entry.thread] });
+        this.visible = groups.map((group) => {
+          if (group.kind !== 'stack') return group;
+          const threads = [...group.threads].sort((a, b) => likesOf(b) - likesOf(a)
+            || String(a.root.id).localeCompare(String(b.root.id)));
+          if (threads.length === 1) return { kind: 'thread', thread: threads[0] };
+          return {
+            kind: 'stack',
+            key: 'stack:' + threads.map((thread) => thread.root.id).sort().join('|'),
+            anchor: group.anchor,
+            threads,
+          };
+        });
       }
-      this.visible = groups.map((group) => {
-        if (group.kind !== 'stack') return group;
-        const threads = [...group.threads].sort((a, b) => likesOf(b) - likesOf(a)
-          || String(a.root.id).localeCompare(String(b.root.id)));
-        if (threads.length === 1) return { kind: 'thread', thread: threads[0] };
-        return {
-          kind: 'stack',
-          key: 'stack:' + threads.map((thread) => thread.root.id).sort().join('|'),
-          anchor: group.anchor,
-          threads,
-        };
-      });
     }
 
     const syncRecords = [];
@@ -322,11 +374,11 @@ export class CommentsView {
     if (this.following) this.tick(this.media, true);
   }
 
-  pickTarget(group) {
-    if (!group) return null;
+  pickTarget(ids) {
+    if (!ids?.length) return null;
     const threadsOf = (item) => (item.kind === 'stack' ? item.threads : [item.thread]);
     let fallback = null;
-    for (const id of group.keys()) {
+    for (const id of ids) {
       const root = this.owners.get(id);
       const item = this.visible.find((entry) => threadsOf(entry).some((thread) => thread.root.id === root));
       if (!item) continue;
@@ -350,6 +402,7 @@ export class CommentsView {
     if (index < 0 && citation) {
       this.timestampOnly.checked = false;
       this.query = '';
+      this.updatePlayhead();
       this.filter();
       index = this.visible.findIndex((item) => threadsOf(item).some((thread) => thread.root.id === root));
     }
@@ -375,35 +428,72 @@ export class CommentsView {
     return true;
   }
 
-  tick(media, force = false) {
-    this.media = media;
-    if (!this.following) return;
-    const group = media ? activeTimestamp(this.syncTimeline, media.currentTime, this.settings.highlightOffset) : null;
-    if (!force && group === this.group) return;
-    this.group = group;
-    const changed = group !== this.active;
-    clearTimeout(this.highlightTimer);
-    this.highlightTimer = null;
-    this.active = group;
-    if (group && (changed || force)) {
-      const target = this.pickTarget(group);
-      if (target) this.jump(target, false);
+  scheduleCommentExpiry(id, endVideoTime, currentTime, rate, paused) {
+    const existing = this.activeTimers.get(id);
+    if (existing) {
+      clearTimeout(existing);
+      this.activeTimers.delete(id);
     }
-    this.updateMarks();
-    this.startHighlightTimer(group);
+    if (paused) return;
+    const remainingMs = Math.max(0, Math.round(((endVideoTime - currentTime) / rate) * 1000));
+    const timer = setTimeout(() => {
+      if (this.activeTimers.get(id) !== timer) return;
+      this.activeTimers.delete(id);
+      if (this.active.delete(id)) this.updateMarks();
+    }, remainingMs + 25);
+    this.activeTimers.set(id, timer);
   }
 
-  startHighlightTimer(group) {
-    const seconds = Math.max(0, Number(this.settings.highlightDuration) || 0);
-    if (!group || !seconds) return;
-    const timer = setTimeout(() => {
-      if (this.highlightTimer !== timer) return;
-      this.highlightTimer = null;
-      if (this.active !== group) return;
-      this.active = null;
-      this.updateMarks();
-    }, seconds * 1000);
-    this.highlightTimer = timer;
+  tick(media, force = false) {
+    this.media = media;
+    this.updatePlayhead();
+    if (!this.following) return;
+    if (!media || !Number.isFinite(media.currentTime)) {
+      if (this.active.size) {
+        this.clearHighlight();
+        this.updateMarks();
+      }
+      return;
+    }
+    const rate = Number.isFinite(media.playbackRate) && media.playbackRate > 0 ? media.playbackRate : 1;
+    const before = this.settings.highlightBefore ?? 3;
+    const after = this.settings.highlightAfter ?? 3;
+    const next = activeTimestamps(this.syncTimeline, media.currentTime, before, after, rate);
+    let changed = false;
+    for (const id of [...this.active.keys()]) {
+      if (!next.has(id)) {
+        const timer = this.activeTimers.get(id);
+        if (timer) clearTimeout(timer);
+        this.activeTimers.delete(id);
+        this.active.delete(id);
+        changed = true;
+      }
+    }
+    const newlyEntered = [];
+    for (const [id, entry] of next.entries()) {
+      if (!this.active.has(id)) {
+        newlyEntered.push(id);
+        changed = true;
+      }
+      this.active.set(id, entry.hit);
+      this.scheduleCommentExpiry(id, entry.endVideoTime, media.currentTime, rate, !!media.paused);
+    }
+    if (newlyEntered.length) {
+      const target = this.pickTarget(newlyEntered);
+      if (target) {
+        this.lastHighlightedId = target;
+        this.jump(target, false);
+        return;
+      }
+    } else if (force && next.size) {
+      const target = this.pickTarget([...next.keys()]);
+      if (target) {
+        this.lastHighlightedId = target;
+        this.jump(target, false);
+        return;
+      }
+    }
+    if (changed) this.updateMarks();
   }
 
   showEmpty(message) {
@@ -440,7 +530,11 @@ export class CommentsView {
     this.list.replaceChildren(fragment);
     if (preserve) this.list.scrollTop = top;
     this.expectedScrollTop = this.list.scrollTop;
+    this.lastWidth = this.list.clientWidth || this.lastWidth;
     this.updateMarks();
+    if (typeof requestAnimationFrame === 'function') {
+      requestAnimationFrame(() => { if (this.nodes?.size) this.syncReadMore(); });
+    }
   }
 
   // Keep the clicked top-level comment fixed in the viewport when replies open or stacks expand.
@@ -493,12 +587,14 @@ export class CommentsView {
       }
     }
     const count = replies.length;
-    const batch = this.settings.replyBatch;
+    const rawBatch = Number(this.settings.replyBatch);
+    const loadAll = rawBatch === 0;
+    const batch = loadAll ? count : (rawBatch > 0 ? rawBatch : 10);
     const expansion = this.query || this.timestampOnly.checked ? this.filteredExpanded : this.expanded;
     const expanded = expansion.get(root.id) ?? (matchedReplies ? batch : 0);
     const jumpIndex = this.jumpReply ? replies.findIndex((reply) => reply.id === this.jumpReply) + 1 : 0;
     const visibleCount = Math.min(count, Math.max(expanded, jumpIndex));
-    const amount = visibleCount && this.settings.allReplies ? count : visibleCount;
+    const amount = visibleCount && loadAll ? count : visibleCount;
     const rootRow = this.renderRecord(root, { stackRole, stackKey, stackExpanded, stackCount });
     if (count) {
       const toggle = button(amount ? 'Hide replies' : count.toLocaleString() + (count === 1 ? ' reply' : ' replies'), 'text-button', () => {
@@ -571,12 +667,10 @@ export class CommentsView {
       likes.append(svg('M7 10v10M7 10l5-7c2 0 2 2 2 3l-.5 4H19a2 2 0 0 1 2 2l-1.5 6a2 2 0 0 1-2 2H3v-9h4Z'), String(record.likes));
       actions.append(likes);
     }
-    const long = record.text.length > 195 || record.text.split('\n').length > 4;
     const more = button('Read more', 'text-button', () => {
       if (this.full.has(record.id)) this.full.delete(record.id);
       else {
         this.full.add(record.id);
-        this.setFollow(false);
         this.focused = record.id;
       }
       this.updateMarks();
@@ -610,7 +704,7 @@ export class CommentsView {
       element.prepend(spacer);
     }
 
-    const row = { element, text, actions, more, record, long, displayed: null, clamped: false };
+    const row = { element, text, actions, more, record, displayed: null, clamp: null };
     this.nodes.set(record.id, row);
     return row;
   }
@@ -618,14 +712,14 @@ export class CommentsView {
   updateMarks() {
     let changed = false;
     for (const row of this.nodes.values()) {
-      const { record, long, element, text } = row;
+      const { record, element, text } = row;
       const hit = this.active?.get(record.id);
       const full = this.full.has(record.id);
       // Timestamp-only mode always starts at the top of the comment and cuts it to four lines.
       const cut = this.timestampOnly.checked && !full;
       const preview = !!hit && !full && !cut;
       const value = preview ? sidebarPreview(record.text, hit) : record.text || '(No text)';
-      const clamp = !full && !preview && (cut || long);
+      const clamp = !full && !preview;
       element.classList.toggle('marked', !!hit || this.focused === record.id);
       if (row.clamp !== clamp) {
         row.clamp = clamp;
@@ -642,15 +736,24 @@ export class CommentsView {
     if (changed) this.syncReadMore();
   }
 
-  // Show "Read more" only when the cut actually hides text (or when expanded, to collapse it).
+  // Show "Read more" only when clamping actually hides text at the current panel width.
   syncReadMore() {
     for (const row of this.nodes.values()) {
       const full = this.full.has(row.record.id);
-      const clipped = row.text.classList.contains('clamped')
-        && row.text.scrollHeight > row.text.clientHeight + 1;
-      row.more.hidden = !full && !clipped && row.displayed === row.record.text;
-      row.more.textContent = full ? 'Show less' : 'Read more';
-      row.more.setAttribute('aria-expanded', String(full));
+      const original = row.record.text || '(No text)';
+      const isPreview = row.displayed !== original;
+      if (full) {
+        const needsToggle = exceedsClampLines(row.text);
+        row.more.hidden = !needsToggle;
+        row.more.textContent = 'Show less';
+        row.more.setAttribute('aria-expanded', 'true');
+      } else {
+        const clipped = row.text.classList.contains('clamped')
+          && row.text.scrollHeight > row.text.clientHeight + 1;
+        row.more.hidden = !clipped && !isPreview;
+        row.more.textContent = 'Read more';
+        row.more.setAttribute('aria-expanded', 'false');
+      }
     }
   }
 }

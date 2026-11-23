@@ -6,8 +6,8 @@ globalThis.YTCT = (() => {
 
   const settingsDefaults = Object.freeze({
     format: 'markdown', shareTranscript: false, autoCollect: false, contextWindow: 32768, debugOllama: false, cacheEnabled: false,
-    cacheDays: 7, cacheMB: 100, unusedCacheHours: 24, highlightOffset: -3, replyBatch: 10, allReplies: false,
-    fontScale: 100, highlightDuration: 6, stackWindow: 3,
+    cacheDays: 7, cacheMB: 100, unusedCacheHours: 24, highlightBefore: 3, highlightAfter: 3, replyBatch: 10,
+    fontScale: 100, stackComments: true, stackWindow: 3, linkTheater: false,
   });
 
   function sourceKey(url) {
@@ -226,6 +226,32 @@ globalThis.YTCT = (() => {
       else right = mid;
     }
     return timeline[left - 1]?.[1] || null;
+  }
+
+  function activeTimestamps(timeline, time, beforeSeconds, afterSeconds, playbackRate = 1) {
+    const active = new Map();
+    if (!timeline?.length || !Number.isFinite(time)) return active;
+    const rate = Number.isFinite(playbackRate) && playbackRate > 0 ? playbackRate : 1;
+    const before = Math.max(0, Number(beforeSeconds) || 0) * rate;
+    const after = Math.max(0, Number(afterSeconds) || 0) * rate;
+    const low = time - after;
+    const high = time + before;
+    let left = 0;
+    let right = timeline.length;
+    while (left < right) {
+      const mid = Math.floor((left + right) / 2);
+      if (timeline[mid][0] < low) left = mid + 1;
+      else right = mid;
+    }
+    for (let i = left; i < timeline.length && timeline[i][0] <= high; i++) {
+      const [seconds, group] = timeline[i];
+      const endVideoTime = seconds + after;
+      for (const [id, hit] of group.entries()) {
+        const prev = active.get(id);
+        if (!prev || endVideoTime > prev.endVideoTime) active.set(id, { hit, seconds, endVideoTime });
+      }
+    }
+    return active;
   }
 
   const AI_SYSTEM_PROMPT = [
@@ -458,6 +484,6 @@ globalThis.YTCT = (() => {
 
   return Object.freeze({ settingsDefaults, sourceKey, isMediaSource, sourceLink, formatDuration, parseLikes,
     buildMarkdown, buildJson, sanitizeName, stamp, markdownSourceKey, exportTimestamp, parseTimestampToSeconds, TIMESTAMP_PATTERN,
-    commentTimestamps, sidebarPreview, timelineFor, activeTimestamp, commentsFromExport, commentRows,
+    commentTimestamps, sidebarPreview, timelineFor, activeTimestamp, activeTimestamps, commentsFromExport, commentRows,
     buildAiContext, citationLinks, outputTokenBudget, estimatedTokens, maxEntryBytes });
 })();

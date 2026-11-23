@@ -118,17 +118,22 @@
   function mediaTime() {
     const player = video();
     if (!player) return null;
-    return { currentTime: player.currentTime, duration: Number.isFinite(player.duration) ? player.duration : null };
+    return {
+      currentTime: player.currentTime,
+      duration: Number.isFinite(player.duration) ? player.duration : null,
+      playbackRate: Number.isFinite(player.playbackRate) && player.playbackRate > 0 ? player.playbackRate : 1,
+      paused: !!player.paused,
+    };
   }
 
   function sendTime(event) {
-    sendAll({ event: 'time', key: source?.key, media: mediaTime(), seek: !!event && event.type !== 'timeupdate' });
+    sendAll({ event: 'time', key: source?.key, media: mediaTime(), seek: !!event && event.type === 'seeked' });
   }
 
   function bindVideo() {
     const found = panels.size ? video() : null;
     if (found === media) return;
-    for (const event of ['timeupdate', 'seeked', 'loadedmetadata', 'durationchange']) {
+    for (const event of ['timeupdate', 'seeked', 'loadedmetadata', 'durationchange', 'ratechange', 'play', 'pause']) {
       media?.removeEventListener(event, sendTime);
       found?.addEventListener(event, sendTime);
     }
@@ -157,6 +162,8 @@
   // ---- theater mode while the side panel is open
   // The comments replace the recommendations visually, without changing YouTube's layout.
   const theater = { owned: false };
+  let linkTheater = false;
+  let skipEnsureTheaterUntil = 0;
   let theaterTimer = null;
   let alignTimer = null;
   let headerObserver = null;
@@ -183,9 +190,37 @@
     } catch {}
   }
 
+  function isEditableTarget(event) {
+    const path = typeof event.composedPath === 'function' ? event.composedPath() : [event.target];
+    for (const node of path) {
+      if (!node || node.nodeType !== 1) continue;
+      const tag = node.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || node.isContentEditable) return true;
+      const editable = node.getAttribute?.('contenteditable');
+      if (editable === '' || editable === 'true' || editable === 'plaintext-only') return true;
+    }
+    return false;
+  }
+
+  function armTheaterOpen(current) {
+    if (!linkTheater || !current?.mounted || !current.key.startsWith('video:')
+      || panels.size || current.theaterOpened || current.pendingTheaterOpen) return;
+    if (theaterActive()) current.pendingTheaterOpen = true;
+  }
+
+  function openPanelFromTheaterGesture(enteringViaControl) {
+    if (!source || panels.size) return;
+    source.pendingTheaterOpen = false;
+    source.theaterOpened = true;
+    markTheaterOwned(false);
+    if (enteringViaControl) skipEnsureTheaterUntil = Date.now() + 900;
+    chrome.runtime.sendMessage({ type: 'open-panel' }).catch(() => {});
+  }
+
   function ensureTheater(attempt = 0) {
     clearTimeout(theaterTimer);
     if (!panels.size || !source?.mounted || !source.key.startsWith('video:')) return;
+    if (Date.now() < skipEnsureTheaterUntil) return;
     if (theaterActive()) {
       // A previous document may have turned theater on for this panel.
       try { if (sessionStorage.getItem('ytct-theater-owned') === '1') theater.owned = true; } catch {}
@@ -248,6 +283,8 @@
       if (source === current) {
         current.mounted = true;
         current.autoCollect = binding?.autoCollect === true;
+        linkTheater = binding?.linkTheater === true;
+        armTheaterOpen(current);
         refresh();
         sendAll(stateForPanel());
         scheduleCollection(current);
@@ -289,7 +326,32 @@
     }, 3200);
   }
 
-  function collect(current, { background = false, fresh = false } = {}) {
+  function mergeIncrementalSnapshot(baseSnapshot, deltaSnapshot) {
+    const updatedCounts = deltaSnapshot.updatedReplyCounts || {};
+    const byId = new Map();
+    for (const comment of deltaSnapshot.comments || []) byId.set(comment.id, comment);
+    for (const comment of baseSnapshot.comments || []) {
+      if (!byId.has(comment.id)) {
+        const nextReplyCount = updatedCounts[comment.id];
+        byId.set(comment.id, nextReplyCount ? { ...comment, replyCount: nextReplyCount } : comment);
+      }
+    }
+    const comments = [...byId.values()].slice(0, 50000);
+    return {
+      ...baseSnapshot,
+      metadata: deltaSnapshot.metadata?.title ? { ...baseSnapshot.metadata, ...deltaSnapshot.metadata } : baseSnapshot.metadata,
+      exportedAt: deltaSnapshot.exportedAt || new Date().toISOString(),
+      reportedCount: Math.max(deltaSnapshot.reportedCount || 0, baseSnapshot.reportedCount || 0, comments.length),
+      collection: {
+        ...baseSnapshot.collection,
+        status: deltaSnapshot.collection?.status === 'complete' && baseSnapshot.collection?.status === 'complete' ? 'complete' : 'partial',
+        limitReached: !!baseSnapshot.collection?.limitReached || !!deltaSnapshot.collection?.limitReached || comments.length >= 50000,
+      },
+      comments,
+    };
+  }
+
+  function collect(current, { background = false, fresh = false, refresh = false, knownIds = null, knownAllIds = null, knownReplyCounts = null, baselineCount = 0 } = {}) {
     if (current.job) return current.job;
     if (!background) {
       current.stopped = false;
@@ -303,7 +365,9 @@
       current.progress = { running: true, ratio: 0 };
       refreshDownloads();
       sendAll(stateForPanel());
-      const { snapshot, result } = await page('collect', current, { background, fresh });
+      const { snapshot, result, incremental } = await page('collect', current, {
+        background, fresh, refresh, knownIds, knownAllIds, knownReplyCounts, baselineCount,
+      });
       if (source !== current) return null;
       if (!snapshot) {
         if (result?.status === 'stopped') return null;
@@ -318,6 +382,16 @@
       if (!snapshot.metadata || !Array.isArray(snapshot.comments)
         || new Blob([JSON.stringify(snapshot)]).size > maxEntryBytes - 1024) {
         throw new Error('YouTube returned an invalid or oversized comment export.');
+      }
+      if (incremental) {
+        if (current.export?.snapshot) {
+          const merged = mergeIncrementalSnapshot(current.export.snapshot, snapshot);
+          if (new Blob([JSON.stringify(merged)]).size <= maxEntryBytes - 1024) {
+            current.export = { ...current.export, snapshot: merged };
+          }
+        }
+        sendAll({ event: 'export-delta', key: current.key, pageId: current.pageId, delta: snapshot });
+        return { incremental: true, delta: snapshot };
       }
       const meta = snapshot.metadata;
       const stem = sanitizeName([meta.channel, meta.title, stamp(new Date(snapshot.startedAt || Date.now()))].filter(Boolean).join(' '), 180).replace(/\s+/g, '_');
@@ -354,9 +428,10 @@
     refreshDownloads();
     try {
       const identity = { key: current.key, pageId: current.pageId };
-      if (!current.job && !current.export && await worker({ type: 'download-cache', ...identity })) return;
-      const entry = await (current.job || current.export || collect(current));
-      if (entry && current === source) await worker({ type: 'download-export', ...identity, entry });
+      if (current.job) await current.job;
+      if (!current.export && await worker({ type: 'download-cache', ...identity })) return;
+      const entry = current.export || await collect(current);
+      if (entry && !entry.incremental && current === source) await worker({ type: 'download-export', ...identity, entry });
     } finally {
       current.download = false;
       if (current === source) refreshDownloads();
@@ -593,7 +668,7 @@
     root.setAttribute('aria-modal', 'true');
     root.setAttribute('aria-label', 'Image viewer');
     root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;display:none;overflow:hidden;' +
-      'background:#0b0b0b;touch-action:none;user-select:none;-webkit-user-select:none;cursor:zoom-in';
+      'background:rgba(11,11,11,0.82);backdrop-filter:blur(2px);touch-action:none;user-select:none;-webkit-user-select:none;cursor:default';
     const image = document.createElement('img');
     image.alt = '';
     image.decoding = 'async';
@@ -622,11 +697,20 @@
     root.append(image, close);
     document.documentElement.append(root);
 
-    const state = { open: false, width: 0, height: 0, fit: 1, scale: 1, x: 0, y: 0, drag: null, previousOverflow: '' };
+    const state = {
+      open: false, width: 0, height: 0, fit: 1, scale: 1, x: 0, y: 0,
+      drag: null, backdropClick: null, lastPointer: null, previousOverflow: '',
+    };
     const zoomed = () => state.scale > state.fit + 0.001;
 
     function stage() {
       return { width: root.clientWidth, height: root.clientHeight };
+    }
+
+    function pointOnImage(clientX, clientY) {
+      if (image.hidden || !state.width || !Number.isFinite(clientX) || !Number.isFinite(clientY)) return false;
+      const rect = image.getBoundingClientRect();
+      return clientX >= rect.left && clientX <= rect.right && clientY >= rect.top && clientY <= rect.bottom;
     }
 
     function fitScale(box = stage()) {
@@ -638,10 +722,16 @@
       return state.width * state.scale > box.width + 0.5 || state.height * state.scale > box.height + 0.5;
     }
 
-    function updateCursor() {
-      if (state.drag && canPan()) root.style.cursor = 'grabbing';
-      else if (canPan()) root.style.cursor = 'grab';
-      else root.style.cursor = 'zoom-in';
+    function updateCursor(clientX = state.lastPointer?.x, clientY = state.lastPointer?.y) {
+      if (state.drag && canPan()) {
+        root.style.cursor = 'grabbing';
+        return;
+      }
+      if (!pointOnImage(clientX, clientY)) {
+        root.style.cursor = 'default';
+        return;
+      }
+      root.style.cursor = canPan() ? 'grab' : 'zoom-in';
     }
 
     function applyTransform() {
@@ -696,6 +786,8 @@
     function closeViewer() {
       state.open = false;
       state.drag = null;
+      state.backdropClick = null;
+      state.lastPointer = null;
       image.hidden = true;
       image.removeAttribute('src');
       root.style.display = 'none';
@@ -768,13 +860,23 @@
 
     root.addEventListener('pointerdown', (event) => {
       if (event.button !== 0 || event.target === close || close.contains(event.target)) return;
+      state.lastPointer = { x: event.clientX, y: event.clientY };
+      if (!pointOnImage(event.clientX, event.clientY)) {
+        state.backdropClick = { id: event.pointerId, x: event.clientX, y: event.clientY };
+        return;
+      }
+      state.backdropClick = null;
       state.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: state.x, top: state.y, moved: false };
       try { root.setPointerCapture(event.pointerId); } catch {}
-      updateCursor();
+      updateCursor(event.clientX, event.clientY);
     });
     root.addEventListener('pointermove', (event) => {
+      state.lastPointer = { x: event.clientX, y: event.clientY };
       const drag = state.drag;
-      if (!drag || drag.id !== event.pointerId) return;
+      if (!drag || drag.id !== event.pointerId) {
+        updateCursor(event.clientX, event.clientY);
+        return;
+      }
       const dx = event.clientX - drag.x;
       const dy = event.clientY - drag.y;
       if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
@@ -785,19 +887,33 @@
       applyTransform();
     });
     function endDrag(event) {
+      if (state.backdropClick && (!event || event.pointerId === state.backdropClick.id)) {
+        const click = state.backdropClick;
+        state.backdropClick = null;
+        if (event?.type === 'pointerup'
+          && Math.abs(event.clientX - click.x) + Math.abs(event.clientY - click.y) <= 6
+          && !pointOnImage(event.clientX, event.clientY)) {
+          closeViewer();
+        }
+        return;
+      }
       const drag = state.drag;
       if (!drag || (event && event.pointerId !== drag.id)) return;
       state.drag = null;
       try { root.releasePointerCapture(drag.id); } catch {}
-      updateCursor();
-      if (event && event.type === 'pointerup' && !drag.moved) toggleZoom(event.clientX, event.clientY);
+      if (event && event.type === 'pointerup' && !drag.moved && pointOnImage(event.clientX, event.clientY)) {
+        toggleZoom(event.clientX, event.clientY);
+      } else {
+        updateCursor(event?.clientX, event?.clientY);
+      }
     }
     root.addEventListener('pointerup', endDrag);
     root.addEventListener('pointercancel', endDrag);
     root.addEventListener('wheel', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!state.open || !state.width) return;
+      if (!state.open || !state.width || !pointOnImage(event.clientX, event.clientY)) return;
+      state.lastPointer = { x: event.clientX, y: event.clientY };
       const scale = event.deltaMode === 1 ? 32 : event.deltaMode === 2 ? 240 : 1;
       const dy = Math.max(-240, Math.min(240, event.deltaY * scale));
       if (!dy) return;
@@ -864,11 +980,58 @@
     if (mountTimer) return;
     mountTimer = setTimeout(() => {
       mountTimer = null;
-      scanSource();
+      const current = scanSource();
+      armTheaterOpen(current);
       refresh();
       decoratePostImages();
     }, 250);
   }
+
+  chrome.runtime.onMessage.addListener((message, sender) => {
+    if (sender.id !== chrome.runtime.id || message?.type !== 'ytct-settings') return;
+    if (typeof message.linkTheater === 'boolean') {
+      linkTheater = message.linkTheater;
+      if (linkTheater) armTheaterOpen(source);
+      else if (source) source.pendingTheaterOpen = false;
+    }
+  });
+
+  window.addEventListener('keydown', (event) => {
+    if (!event.isTrusted || event.repeat || !linkTheater || !source?.mounted || !source.key.startsWith('video:')) return;
+    if (isEditableTarget(event)) return;
+    const isTheaterKey = (event.key === 't' || event.key === 'T') && !event.ctrlKey && !event.altKey && !event.metaKey && !event.shiftKey;
+    if (isTheaterKey) {
+      if (theaterActive()) {
+        source.pendingTheaterOpen = false;
+        source.theaterOpened = true;
+        return;
+      }
+      if (!panels.size) openPanelFromTheaterGesture(true);
+      return;
+    }
+    if (source.pendingTheaterOpen && !panels.size && theaterActive()
+      && !['Shift', 'Control', 'Alt', 'Meta', 'CapsLock', 'Tab', 'Escape'].includes(event.key)) {
+      openPanelFromTheaterGesture(false);
+    }
+  }, true);
+
+  document.addEventListener('click', (event) => {
+    if (!event.isTrusted || !linkTheater || !source?.mounted || !source.key.startsWith('video:')) return;
+    const target = event.target;
+    if (target?.closest?.('#' + toolbarId)) return;
+    if (target?.closest?.('.ytp-size-button')) {
+      if (theaterActive()) {
+        source.pendingTheaterOpen = false;
+        source.theaterOpened = true;
+        return;
+      }
+      if (!panels.size) openPanelFromTheaterGesture(true);
+      return;
+    }
+    if (source.pendingTheaterOpen && !panels.size && theaterActive() && !target?.closest?.('a[href]')) {
+      openPanelFromTheaterGesture(false);
+    }
+  }, true);
 
   chrome.runtime.onConnect.addListener((port) => {
     const extensionOrigin = chrome.runtime.getURL('').slice(0, -1);
@@ -882,6 +1045,10 @@
       return;
     }
     panels.add(port);
+    if (source) {
+      source.pendingTheaterOpen = false;
+      source.theaterOpened = true;
+    }
     port.postMessage(stateForPanel());
     bindVideo();
     refreshOpener();
@@ -903,7 +1070,17 @@
       async function handle() {
         if (message.action === 'seek') return seek(message.seconds);
         if (message.action === 'load-collected') return current.export || null;
-        if (message.action === 'collect') return collect(current, { fresh: !!message.fresh });
+        if (message.action === 'check-count') return page('check-count', current);
+        if (message.action === 'collect') {
+          return collect(current, {
+            fresh: !!message.fresh,
+            refresh: !!message.refresh,
+            knownIds: Array.isArray(message.knownIds) ? message.knownIds : null,
+            knownAllIds: Array.isArray(message.knownAllIds) ? message.knownAllIds : null,
+            knownReplyCounts: message.knownReplyCounts && typeof message.knownReplyCounts === 'object' ? message.knownReplyCounts : null,
+            baselineCount: Number(message.baselineCount) || 0,
+          });
+        }
         if (message.action === 'stop') {
           current.stopped = true;
           clearTimeout(current.scheduleTimer);

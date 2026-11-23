@@ -24,7 +24,7 @@
   }
 
   async function run(port, { id, path, payload }) {
-    if (active.has(id) || !['/api/chat', '/api/generate'].includes(path)) return;
+    if (active.has(id) || !['/api/chat', '/api/generate', '/api/show'].includes(path)) return;
     const controller = new AbortController();
     active.set(id, controller);
     function send(type, data) {

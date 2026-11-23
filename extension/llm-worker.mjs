@@ -3,9 +3,11 @@
 import {
   activeProfile, canonicalEndpoint, chatEndpoint, maskKey, modelsEndpoint, normalizeLlmConfig,
   normalizeProfile, originPattern, profileDestination, providerHeaders, providerKeyRequired, providerOrigin,
-  providerSpecFor, reasoningEffort,
+  providerSpecFor, reasoningEffort, resolveModelCapabilities,
 } from './llm-config.mjs';
 import { relayOffscreen } from './offscreen-worker.mjs';
+import { relayLoopback } from './loopback-worker.mjs';
+import { showModel } from './ollama.mjs';
 
 const CONFIG_KEY = 'llmConfig';
 const KEYS_KEY = 'llmKeys';
@@ -261,15 +263,89 @@ function boundedResponse(response, maxBytes = 4 * 1024 * 1024) {
   })), { headers: response.headers });
 }
 
-function parseModelIds(data) {
+function extractContextLength(row) {
+  if (!row || typeof row !== 'object') return 0;
+  const candidates = [
+    row.context_length,
+    row.context_window,
+    row.max_context_length,
+    row.max_input_tokens,
+    row.input_token_limit,
+    row.inputTokenLimit,
+    row.top_provider?.context_length,
+    row.meta?.n_ctx_train,
+    row.loaded_context_length,
+    row.info?.params?.num_ctx,
+  ];
+  for (const raw of candidates) {
+    const value = Math.floor(Number(raw));
+    if (Number.isFinite(value) && value >= 1024) return value;
+  }
+  return 0;
+}
+
+function extractThinkingMeta(row) {
+  if (!row || typeof row !== 'object') return null;
+  if (row.capabilities && typeof row.capabilities === 'object' && !Array.isArray(row.capabilities)) {
+    const capThinking = row.capabilities.thinking;
+    if (typeof capThinking === 'boolean' || typeof capThinking?.supported === 'boolean') {
+      const supported = typeof capThinking === 'boolean' ? capThinking : capThinking.supported;
+      if (!supported) return { supported: false, levels: ['default'] };
+      const effort = row.capabilities.effort;
+      const levels = ['default', 'off'];
+      if (effort?.supported && typeof effort === 'object') {
+        for (const level of ['low', 'medium', 'high']) {
+          if (effort[level]?.supported !== false) levels.push(level);
+        }
+      } else {
+        levels.push('low', 'medium', 'high');
+      }
+      return { supported: true, levels };
+    }
+  }
+  if (Array.isArray(row.capabilities)) {
+    const supported = row.capabilities.includes('thinking') || row.capabilities.includes('reasoning');
+    return supported
+      ? { supported: true, levels: ['default', 'off', 'on', 'low', 'medium', 'high'] }
+      : { supported: false, levels: ['default'] };
+  }
+  if (Array.isArray(row.supported_parameters)) {
+    const params = new Set(row.supported_parameters.map((item) => String(item).toLowerCase()));
+    if (params.has('reasoning') || params.has('include_reasoning') || params.has('reasoning_effort')) {
+      return { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] };
+    }
+    return { supported: false, levels: ['default'] };
+  }
+  if (Array.isArray(row.reasoning_effort_levels) && row.reasoning_effort_levels.length) {
+    return { supported: true, levels: ['default', ...row.reasoning_effort_levels] };
+  }
+  for (const flag of [row.thinking, row.supports_thinking, row.supports_reasoning, row.reasoning]) {
+    if (typeof flag === 'boolean') {
+      return flag
+        ? { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] }
+        : { supported: false, levels: ['default'] };
+    }
+  }
+  return null;
+}
+
+export function parseModelCatalog(provider, data) {
   const rows = Array.isArray(data?.data) ? data.data
     : Array.isArray(data?.models) ? data.models
       : Array.isArray(data) ? data : [];
-  const ids = rows.map((row) => {
-    if (typeof row === 'string') return row;
-    return row?.id || row?.name || row?.model || '';
-  }).filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim());
-  return [...new Set(ids)].sort((a, b) => a.localeCompare(b)).slice(0, 500);
+  const byId = new Map();
+  for (const row of rows) {
+    const id = typeof row === 'string' ? row.trim() : String(row?.id || row?.name || row?.model || '').trim();
+    if (!id) continue;
+    const apiMeta = typeof row === 'object' && row
+      ? { contextLength: extractContextLength(row), thinking: extractThinkingMeta(row) }
+      : null;
+    if (!byId.has(id)) byId.set(id, resolveModelCapabilities(provider, id, apiMeta));
+  }
+  const models = [...byId.keys()].sort((a, b) => a.localeCompare(b)).slice(0, 500);
+  const modelMeta = {};
+  for (const id of models) modelMeta[id] = byId.get(id);
+  return { models, modelMeta };
 }
 
 async function requestChat(profile, key, messages, thinking, signal) {
@@ -282,7 +358,7 @@ async function requestChat(profile, key, messages, thinking, signal) {
   const body = { model: profile.model, messages, stream: true };
   body.max_tokens = 4096;
   if (!spec.local) body.stream_options = { include_usage: true };
-  const effort = reasoningEffort(thinking || profile.thinking);
+  const effort = profile.thinkingCapabilities?.supported === false ? '' : reasoningEffort(thinking || profile.thinking);
   if (effort) body.reasoning_effort = effort;
   const headers = {
     Accept: 'text/event-stream',
@@ -340,7 +416,8 @@ async function fetchProviderModels(profile, key, signal) {
     throw providerError(response.status, raw, profile, endpoint, key);
   }
   const data = await boundedResponse(response).json();
-  return { models: parseModelIds(data), endpoint, latency: Date.now() - started };
+  const { models, modelMeta } = parseModelCatalog(profile.provider, data);
+  return { models, modelMeta, endpoint, latency: Date.now() - started };
 }
 
 async function testChat(profile, key, signal) {
@@ -402,12 +479,78 @@ export async function listLlmModels(message = {}) {
       provider: profile.provider,
       endpoint: result.endpoint,
       models: result.models,
+      modelMeta: result.modelMeta,
       latency: result.latency,
     };
   } catch (error) {
     error.message = scrubKey(error.message || String(error), key);
     throw error;
   }
+}
+
+export async function getLlmModelInfo(message = {}) {
+  const { profile, key } = await requestProfile(message);
+  if (!profile.model) return { model: '', capabilities: resolveModelCapabilities(profile.provider, '') };
+  let apiMeta = null;
+  try {
+    if (profile.provider === 'ollama') {
+      await ensureHostAccess(profile);
+      apiMeta = await showModel(profile.model, relayLoopback);
+    } else if (profile.provider === 'gemini' && key) {
+      await ensureHostAccess(profile);
+      const id = profile.model.replace(/^models\//, '');
+      const url = 'https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(id);
+      const res = await fetch(url, {
+        headers: { Accept: 'application/json', 'x-goog-api-key': key },
+        signal: AbortSignal.timeout(10000),
+        credentials: 'omit',
+        redirect: 'error',
+      });
+      if (res.ok) {
+        const data = await boundedResponse(res, 256 * 1024).json();
+        apiMeta = {
+          contextLength: extractContextLength(data),
+          thinking: typeof data?.thinking === 'boolean'
+            ? (data.thinking ? { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] } : { supported: false, levels: ['default'] })
+            : null,
+        };
+      }
+    } else if (profile.provider === 'llamacpp') {
+      await ensureHostAccess(profile);
+      const origin = providerOrigin(profile);
+      const res = await fetch(origin + '/props', {
+        headers: { Accept: 'application/json', ...providerHeaders(profile, key, 'models') },
+        signal: AbortSignal.timeout(6000),
+        credentials: 'omit',
+        redirect: 'error',
+      });
+      if (res.ok) {
+        const data = await boundedResponse(res, 256 * 1024).json();
+        const nCtx = Math.floor(Number(data?.default_generation_settings?.n_ctx));
+        if (Number.isFinite(nCtx) && nCtx >= 1024) apiMeta = { contextLength: nCtx, thinking: null };
+      }
+    } else if (profile.provider === 'lmstudio') {
+      await ensureHostAccess(profile);
+      const origin = providerOrigin(profile);
+      const res = await fetch(origin + '/api/v0/models', {
+        headers: { Accept: 'application/json', ...providerHeaders(profile, key, 'models') },
+        signal: AbortSignal.timeout(6000),
+        credentials: 'omit',
+        redirect: 'error',
+      });
+      if (res.ok) {
+        const data = await boundedResponse(res, 512 * 1024).json();
+        const catalog = parseModelCatalog('lmstudio', data);
+        if (catalog.modelMeta[profile.model]) apiMeta = catalog.modelMeta[profile.model];
+      }
+    }
+  } catch {
+    // Fall back to known/cached capabilities if optional detail endpoint is unavailable.
+  }
+  return {
+    model: profile.model,
+    capabilities: resolveModelCapabilities(profile.provider, profile.model, apiMeta),
+  };
 }
 
 export async function testLlmConnection(message = {}) {
@@ -417,16 +560,18 @@ export async function testLlmConnection(message = {}) {
   }
   const started = Date.now();
   let models = [];
+  let modelMeta = {};
   let modelError;
   try {
     try {
       const listed = await fetchProviderModels(profile, key, AbortSignal.timeout(15000));
       models = listed.models;
+      modelMeta = listed.modelMeta || {};
       if (profile.provider === 'ollama') {
         if (!profile.model) {
           if (!models.length) throw new Error('Ollama is reachable, but no models are installed.');
           return {
-            ok: true, mode: 'models', provider: profile.provider, models,
+            ok: true, mode: 'models', provider: profile.provider, models, modelMeta,
             latency: listed.latency,
           };
         }
@@ -434,7 +579,7 @@ export async function testLlmConnection(message = {}) {
           throw new Error('Ollama is reachable, but it does not list the selected model.');
         }
         return {
-          ok: true, mode: 'models', provider: profile.provider, models,
+          ok: true, mode: 'models', provider: profile.provider, models, modelMeta,
           latency: listed.latency,
         };
       }
@@ -451,7 +596,7 @@ export async function testLlmConnection(message = {}) {
     }
     await testChat(profile, key, AbortSignal.timeout(12000));
     return {
-      ok: true, mode: 'chat', provider: profile.provider, models,
+      ok: true, mode: 'chat', provider: profile.provider, models, modelMeta,
       latency: Date.now() - started,
     };
   } catch (error) {

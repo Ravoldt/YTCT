@@ -5,7 +5,7 @@ import { connectOffscreen, saveDownload } from './offscreen-worker.mjs';
 import { normalizeEntry } from './export-entry.mjs';
 import {
   activateLlmProfile, activeOllamaModel, connectLlmChat, deleteLlmProfile,
-  getLlmConfig, listLlmModels, revealLlmKey, saveLlmProfile, testLlmConnection,
+  getLlmConfig, getLlmModelInfo, listLlmModels, revealLlmKey, saveLlmProfile, testLlmConnection,
 } from './llm-worker.mjs';
 
 const { settingsDefaults, sourceKey, isMediaSource } = YTCT;
@@ -71,22 +71,29 @@ function bounded(value, fallback, min, max) {
 
 function normalizeSettings(raw = {}) {
   const s = { ...settingsDefaults, ...raw };
+  const legacyBefore = raw.highlightBefore === undefined && raw.highlightOffset !== undefined
+    ? Math.max(0, -Number(raw.highlightOffset)) : s.highlightBefore;
+  const before = bounded(legacyBefore, 3, 0, 120);
+  const legacyAfter = raw.highlightAfter === undefined && raw.highlightDuration !== undefined
+    ? Math.max(0, Number(raw.highlightDuration) - before) : s.highlightAfter;
+  const rawReplyBatch = raw.allReplies === true ? 0 : s.replyBatch;
   return {
     format: s.format === 'json' ? 'json' : 'markdown',
     shareTranscript: s.shareTranscript === true,
     autoCollect: s.autoCollect === true,
     cacheEnabled: s.cacheEnabled === true,
     debugOllama: !!s.debugOllama,
-    contextWindow: bounded(s.contextWindow, 32768, 1024, 262144),
-    highlightOffset: bounded(s.highlightOffset, -3, Number.MIN_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
+    contextWindow: bounded(s.contextWindow, 32768, 1024, 2097152),
+    highlightBefore: before,
+    highlightAfter: bounded(legacyAfter, 3, 0, 120),
     cacheDays: bounded(s.cacheDays, 7, 1, 3650),
     cacheMB: bounded(s.cacheMB, 100, 1, 1000),
     unusedCacheHours: bounded(s.unusedCacheHours, 24, 1, 8760),
-    replyBatch: bounded(s.replyBatch, 10, 1, 10000),
-    allReplies: !!s.allReplies,
+    replyBatch: bounded(rawReplyBatch, 10, 0, 10000),
     fontScale: bounded(s.fontScale, 100, 70, 160),
-    highlightDuration: bounded(s.highlightDuration, 6, 0, 120),
+    stackComments: s.stackComments !== false,
     stackWindow: bounded(s.stackWindow, 3, 0, 60),
+    linkTheater: s.linkTheater === true,
   };
 }
 
@@ -144,7 +151,10 @@ async function setVisit(tabId, key, pageId = '') {
   if (prior && (prior.pageId !== pageId || prior.key !== key)) await chrome.storage.session.remove('chat:' + tabId);
   await persistCache(index, removed);
   const hasSaved = settings.cacheEnabled === true && isMediaSource(key) && !!index[key];
-  return { autoCollect: settings.autoCollect === true && isMediaSource(key) && !hasSaved };
+  return {
+    autoCollect: settings.autoCollect === true && isMediaSource(key) && !hasSaved,
+    linkTheater: settings.linkTheater === true,
+  };
 }
 
 async function cacheAction(message, tabId) {
@@ -156,6 +166,12 @@ async function cacheAction(message, tabId) {
       const saved = normalizeSettings(message.values);
       const result = prune(index, saved, visits);
       await persistCache(index, [...common.removed, ...result.removed], { settings: saved });
+      for (const visitedTabId of Object.keys(visits)) {
+        const numericId = Number(visitedTabId);
+        if (Number.isInteger(numericId) && numericId > 0) {
+          chrome.tabs.sendMessage(numericId, { type: 'ytct-settings', linkTheater: saved.linkTheater }).catch(() => {});
+        }
+      }
       return { settings: saved, bytes: result.bytes, limit: result.limit };
     }
     if (common.removed.length) await persistCache(index, common.removed);
@@ -325,6 +341,9 @@ async function handle(message, sender) {
     case 'llm-models':
       if (!panelTab) throw new Error('Open the side panel to configure the LLM.');
       return listLlmModels(message);
+    case 'llm-model-info':
+      if (!panelTab) throw new Error('Open the side panel to configure the LLM.');
+      return getLlmModelInfo(message);
     case 'llm-test':
       if (!panelTab) throw new Error('Open the side panel to configure the LLM.');
       return testLlmConnection(message);
@@ -385,7 +404,7 @@ function sanitizeOllamaPayload(payload, leasedModel) {
   }
   if (payload.options && typeof payload.options === 'object') {
     result.options = {
-      num_ctx: bounded(payload.options.num_ctx, 32768, 1024, 262144),
+      num_ctx: bounded(payload.options.num_ctx, 32768, 1024, 2097152),
       num_predict: bounded(payload.options.num_predict, 4096, 1, 8192),
     };
   }

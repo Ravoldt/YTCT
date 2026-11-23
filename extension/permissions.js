@@ -30,7 +30,7 @@ if (!origin) {
 
   grant.addEventListener('click', async () => {
     grant.disabled = true;
-    status('Waiting for Chrome’s permission prompt…');
+    status('Waiting for the browser’s permission prompt…');
     try {
       const granted = await chrome.permissions.request({ origins: [pattern] });
       if (granted) {
@@ -42,7 +42,7 @@ if (!origin) {
       }
     } catch (error) {
       grant.disabled = false;
-      status('Chrome could not show the permission prompt: ' + error.message);
+      status('The browser could not show the permission prompt: ' + error.message);
     }
   });
 }

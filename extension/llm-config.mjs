@@ -218,12 +218,19 @@ export const PROVIDER_GROUPS = Object.freeze([
   { label: 'Custom', ids: ['cloud'] },
 ]);
 
-export const THINKING_LEVELS = Object.freeze(['default', 'off', 'low', 'medium', 'high']);
+export const THINKING_LEVELS = Object.freeze(['default', 'off', 'on', 'low', 'medium', 'high']);
+export const MAX_CONTEXT_LIMIT = 2097152;
+export const MIN_CONTEXT_LIMIT = 1024;
+export const DEFAULT_LOCAL_CONTEXT = 32768;
 
 const text = (value, limit) => String(value ?? '').trim().slice(0, limit);
 const number = (value, fallback = 0) => {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+};
+const contextInt = (value) => {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed >= MIN_CONTEXT_LIMIT ? Math.min(MAX_CONTEXT_LIMIT, parsed) : 0;
 };
 const FORBIDDEN_IDS = new Set(['__proto__', 'constructor', 'prototype']);
 const safeId = (value) => {
@@ -235,8 +242,158 @@ export function providerSpec(provider) {
   return PROVIDERS[provider] || PROVIDERS.cloud;
 }
 
+export function isCloudManagedProvider(provider) {
+  const spec = providerSpec(provider);
+  return !spec.local && !spec.custom;
+}
+
+export function normalizeThinkingCapabilities(raw) {
+  if (!raw || typeof raw !== 'object') return { supported: null, levels: ['default', 'off', 'low', 'medium', 'high'] };
+  const supported = typeof raw.supported === 'boolean' ? raw.supported : null;
+  if (supported === false) return { supported: false, levels: ['default'] };
+  const rawLevels = Array.isArray(raw.levels) ? raw.levels.filter((level) => THINKING_LEVELS.includes(level)) : [];
+  const levels = rawLevels.length
+    ? ['default', ...rawLevels.filter((level) => level !== 'default')]
+    : ['default', 'off', 'low', 'medium', 'high'];
+  return { supported, levels: [...new Set(levels)] };
+}
+
+export function knownModelCapabilities(provider, modelId) {
+  const id = String(modelId || '').toLowerCase();
+  const leaf = id.split('/').pop().split(':')[0];
+  let contextLength = 0;
+  let thinking = { supported: null, levels: ['default', 'off', 'low', 'medium', 'high'] };
+  if (/^gpt-5/.test(leaf)) {
+    contextLength = 400000;
+    thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
+  } else if (/^gpt-4\.1/.test(leaf)) {
+    contextLength = 1047576;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^gpt-4o/.test(leaf)) {
+    contextLength = 128000;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^o[134](?:-|$)/.test(leaf)) {
+    contextLength = 200000;
+    thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
+  } else if (/^claude-(?:opus-4|sonnet-4|haiku-4|3-7-sonnet|3\.7-sonnet)/.test(leaf)) {
+    contextLength = 200000;
+    thinking = { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] };
+  } else if (/^claude-3-5|^claude-3\.5/.test(leaf)) {
+    contextLength = 200000;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^gemini-2\.5|^gemini-3/.test(leaf)) {
+    contextLength = 1048576;
+    thinking = { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] };
+  } else if (/^gemini-2\.0/.test(leaf)) {
+    contextLength = 1048576;
+    thinking = { supported: /thinking/.test(leaf), levels: /thinking/.test(leaf) ? ['default', 'off', 'low', 'medium', 'high'] : ['default'] };
+  } else if (/^deepseek-reasoner|^deepseek-r1/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: true, levels: ['default'] };
+  } else if (/^deepseek-chat|^deepseek-v3/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^grok-4/.test(leaf)) {
+    contextLength = 256000;
+    thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
+  } else if (/^grok-3-mini/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: true, levels: ['default', 'low', 'high'] };
+  } else if (/^grok-3/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^sonar-reasoning/.test(leaf)) {
+    contextLength = 128000;
+    thinking = { supported: true, levels: ['default'] };
+  } else if (/^sonar/.test(leaf)) {
+    contextLength = 128000;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^mistral-large|^mistral-small|^ministral|^codestral/.test(leaf)) {
+    contextLength = /codestral/.test(leaf) ? 256000 : 128000;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^llama-3\.[123]|^llama3\.[123]|^meta-llama-3\.[123]|^llama-v3p3/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^qwen3|^qwq/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: true, levels: ['default', 'off', 'on'] };
+  } else if (/^qwen2\.5/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^gpt-oss/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
+  } else if (/^moonshot-v1-8k/.test(leaf)) {
+    contextLength = 8192;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^moonshot-v1-32k/.test(leaf)) {
+    contextLength = 32768;
+    thinking = { supported: false, levels: ['default'] };
+  } else if (/^kimi-k2/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: /thinking/.test(leaf), levels: /thinking/.test(leaf) ? ['default', 'off', 'on'] : ['default'] };
+  } else if (/^glm-4\.5|^glm-4-plus/.test(leaf)) {
+    contextLength = 131072;
+    thinking = { supported: /^glm-4\.5/.test(leaf), levels: /^glm-4\.5/.test(leaf) ? ['default', 'off', 'on'] : ['default'] };
+  }
+  if (!contextLength && isCloudManagedProvider(provider)) contextLength = 128000;
+  return { contextLength, thinking };
+}
+
+export function resolveModelCapabilities(provider, modelId, apiMeta = null) {
+  const fallback = knownModelCapabilities(provider, modelId);
+  const apiContext = contextInt(apiMeta?.contextLength);
+  const apiThinking = apiMeta?.thinking && typeof apiMeta.thinking.supported === 'boolean'
+    ? normalizeThinkingCapabilities(apiMeta.thinking)
+    : null;
+  return {
+    contextLength: apiContext || fallback.contextLength,
+    thinking: apiThinking || normalizeThinkingCapabilities(fallback.thinking),
+  };
+}
+
+export function contextSteps(maxContext, maxStops = 7) {
+  const top = Math.max(MIN_CONTEXT_LIMIT, Math.min(MAX_CONTEXT_LIMIT, Math.floor(Number(maxContext) || 262144)));
+  const floor = top > 4096 ? 4000 : MIN_CONTEXT_LIMIT;
+  const steps = [];
+  let value = top;
+  while (steps.length < maxStops && value >= MIN_CONTEXT_LIMIT) {
+    steps.unshift(value);
+    const half = Math.floor(value / 2);
+    if (half < floor || half === value) break;
+    value = half;
+  }
+  return steps;
+}
+
+export function formatContextLabel(tokens) {
+  const value = Math.floor(Number(tokens) || 0);
+  if (value <= 0) return 'Auto';
+  if (value % 1024 === 0) {
+    const k = value / 1024;
+    if (k >= 1024 && k % 1024 === 0) return (k / 1024) + 'M';
+    return k + 'k';
+  }
+  if (value >= 1000000) return (value / 1000000).toFixed(1).replace(/\.0$/, '') + 'M';
+  if (value >= 1000) return Math.round(value / 1000) + 'k';
+  return String(value);
+}
+
+export function effectiveContextWindow(profile, fallback = DEFAULT_LOCAL_CONTEXT) {
+  if (!profile) return fallback;
+  const known = knownModelCapabilities(profile.provider, profile.model).contextLength;
+  const max = contextInt(profile.maxContext) || known;
+  if (isCloudManagedProvider(profile.provider)) {
+    return max || 128000;
+  }
+  const chosen = contextInt(profile.contextWindow);
+  if (chosen) return max ? Math.min(chosen, max) : chosen;
+  return max ? Math.min(fallback, max) : fallback;
+}
+
 export function defaultProfile(provider = 'cloud') {
   const spec = providerSpec(provider);
+  const caps = knownModelCapabilities(PROVIDERS[provider] ? provider : 'cloud', spec.defaultModel);
   return {
     id: globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now(),
     label: spec.label,
@@ -245,6 +402,9 @@ export function defaultProfile(provider = 'cloud') {
     endpoint: spec.defaultEndpoint,
     model: spec.defaultModel,
     thinking: 'default',
+    contextWindow: isCloudManagedProvider(provider) ? 0 : DEFAULT_LOCAL_CONTEXT,
+    maxContext: caps.contextLength,
+    thinkingCapabilities: caps.thinking,
     pricing: { input: 0, output: 0 },
     hasKey: false,
     keyHint: '',
@@ -259,14 +419,27 @@ export function defaultLlmConfig() {
 export function normalizeProfile(raw, index = 0) {
   const provider = raw && Object.hasOwn(PROVIDERS, raw.provider) ? raw.provider : 'cloud';
   const spec = PROVIDERS[provider];
+  const model = text(raw?.model, 160) || spec.defaultModel;
+  const cloudManaged = isCloudManagedProvider(provider);
+  const maxContext = contextInt(raw?.maxContext) || knownModelCapabilities(provider, model).contextLength;
+  const rawContext = contextInt(raw?.contextWindow);
+  const contextWindow = cloudManaged ? 0 : (rawContext ? (maxContext ? Math.min(rawContext, maxContext) : rawContext) : DEFAULT_LOCAL_CONTEXT);
+  const thinkingCapabilities = raw?.thinkingCapabilities
+    ? normalizeThinkingCapabilities(raw.thinkingCapabilities)
+    : knownModelCapabilities(provider, model).thinking;
+  const thinking = THINKING_LEVELS.includes(raw?.thinking) && thinkingCapabilities.levels.includes(raw.thinking)
+    ? raw.thinking : 'default';
   return {
     id: safeId(raw?.id) || (globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now() + '-' + index),
     label: text(raw?.label, 60) || spec.label,
     name: text(raw?.name, 32),
     provider,
     endpoint: provider === 'ollama' ? spec.defaultEndpoint : (text(raw?.endpoint, 400) || spec.defaultEndpoint),
-    model: text(raw?.model, 160) || spec.defaultModel,
-    thinking: THINKING_LEVELS.includes(raw?.thinking) ? raw.thinking : 'default',
+    model,
+    thinking,
+    contextWindow,
+    maxContext,
+    thinkingCapabilities,
     pricing: { input: number(raw?.pricing?.input), output: number(raw?.pricing?.output) },
     hasKey: !!raw?.hasKey,
     keyHint: text(raw?.keyHint, 8),
@@ -418,6 +591,7 @@ export function maskKey(hint) {
 
 export function reasoningEffort(level) {
   if (level === 'low' || level === 'medium' || level === 'high') return level;
+  if (level === 'on') return 'medium';
   if (level === 'off') return 'none';
   return '';
 }

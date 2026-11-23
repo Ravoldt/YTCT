@@ -18,13 +18,24 @@
   </header>
 
   <div id="video-tools" class="video-tools" hidden>
-    <label class="check"><input id="timestamp-only" type="checkbox"> Timestamped only</label>
+    <div class="mode-toggle-group">
+      <label class="mode-toggle" title="Switch between all comments and timestamped comments">
+        <span class="mode-icon mode-icon-all" aria-hidden="true"></span>
+        <input id="timestamp-only" type="checkbox" role="switch" aria-label="Timestamped comments only">
+        <span class="toggle-track" aria-hidden="true"><span class="toggle-thumb"></span></span>
+        <span class="mode-icon mode-icon-time" aria-hidden="true"></span>
+      </label>
+      <span id="playhead-time" class="playhead-time" hidden></span>
+    </div>
     <button id="follow" class="pill" type="button" aria-pressed="false" disabled>Sync to video time</button>
   </div>
   <div id="notice" role="status" class="notice" hidden></div>
   <div id="collection" class="collection" hidden>
     <span id="collection-status" role="status"></span>
-    <button id="collect" class="pill" type="button">Collect</button>
+    <div class="collection-actions">
+      <span id="new-comments-badge" class="new-comments" hidden></span>
+      <button id="collect" class="pill" type="button">Collect</button>
+    </div>
   </div>
   <main id="comments" aria-label="Comments and replies" tabindex="0"></main>
 
@@ -59,6 +70,12 @@
     </div>
     <form id="composer">
       <input id="query" type="search" placeholder="Search comments" aria-label="Search comments" autocomplete="off">
+      <div id="ask-field" class="ask-field" hidden>
+        <textarea id="ask-input" rows="1" placeholder="Ask LLM about these comments" aria-label="Ask LLM about these comments"></textarea>
+        <button id="expand-ask" class="ask-expand" type="button" aria-pressed="false" title="Expand input to full height" aria-label="Expand input to full height">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path id="expand-ask-path" d="M15 4h5v5M9 20H4v-5M20 4l-6 6M4 20l6-6"/></svg>
+        </button>
+      </div>
       <button id="send" type="submit" class="pill primary" hidden disabled>Ask</button>
     </form>
   </footer>
@@ -82,29 +99,29 @@
         <fieldset>
           <legend>Comments</legend>
           <label>Auto-collect comments after page load <input name="autoCollect" type="checkbox"></label>
-          <label>Replies per click <input name="replyBatch" type="number" min="1" max="10000" required></label>
-          <label>Load all replies <input name="allReplies" type="checkbox"></label>
+          <label>Open side panel with theater mode (T) <input name="linkTheater" type="checkbox"></label>
+          <label>Replies per click (0 = all) <input name="replyBatch" type="number" min="0" max="10000" required></label>
           <label>Text scale
             <span class="range">
               <input id="font-scale" name="fontScale" type="range" min="70" max="160" step="5">
               <output id="font-scale-value" for="font-scale">100%</output>
             </span>
           </label>
-          <label>Highlight offset (seconds) <input name="highlightOffset" type="number" required></label>
-          <label>Highlight duration (seconds) <input name="highlightDuration" type="number" min="0" max="120" required></label>
+          <label>Highlight before timestamp (seconds) <input name="highlightBefore" type="number" min="0" max="120" required></label>
+          <label>Highlight after timestamp (seconds) <input name="highlightAfter" type="number" min="0" max="120" required></label>
+          <label>Stack nearby timestamped comments <input name="stackComments" type="checkbox"></label>
           <label>Stack window (seconds) <input name="stackWindow" type="number" min="0" max="60" required></label>
-          <p class="hint">Negative offsets highlight before the timestamp. A duration of 0 keeps a comment highlighted until the next timestamp. Comments whose timestamps fall within the stack window are grouped.</p>
+          <p class="hint">Highlight times are measured in real seconds regardless of playback speed. When theater mode linking is on, pressing T or clicking theater mode opens the side panel (or on your first click/keypress if already in theater mode).</p>
         </fieldset>
         <fieldset>
           <legend>Assistant</legend>
           <label>Allow Ask to send the video transcript <input name="shareTranscript" type="checkbox"></label>
-          <label>Context window (tokens) <input name="contextWindow" type="number" min="1024" max="262144" required></label>
           <label>Show model telemetry <input name="debugOllama" type="checkbox"></label>
         </fieldset>
         <fieldset>
           <legend>Exports</legend>
           <label>Download format <select name="format"><option value="markdown">Markdown</option><option value="json">JSON</option></select></label>
-          <label>Keep copies in Chrome storage <input name="cacheEnabled" type="checkbox"></label>
+          <label>Keep copies in browser storage <input name="cacheEnabled" type="checkbox"></label>
           <label>Keep exports (days) <input name="cacheDays" type="number" min="1" max="3650" required></label>
           <label>Unused exports (hours after leaving) <input name="unusedCacheHours" type="number" min="1" max="8760" required></label>
           <label>Cache limit (MB) <input name="cacheMB" type="number" min="1" max="1000" required></label>
@@ -113,7 +130,7 @@
           <button type="button" id="load-saved-export" class="pill">Load saved export</button>
           <button type="button" id="clear-cache" class="pill">Clear saved exports</button>
           <button type="button" id="collect-fresh" class="pill">Collect fresh comments</button>
-          <p class="hint">Saved copies can outlast a YouTube account change. Load them only from a Chrome profile you trust.</p>
+          <p class="hint">Saved copies can outlast a YouTube account change. Load them only from a browser profile you trust.</p>
           <input id="import-file" type="file" accept=".md,.markdown,.json" hidden>
         </fieldset>
         <p class="hint"><a href="privacy.html" target="_blank" rel="noopener">Privacy policy</a></p>
@@ -123,7 +140,7 @@
     </form>
 
     <div id="settings-llm" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-llm" hidden>
-        <p class="hint">API keys are saved in this Chrome profile and sent to the configured endpoint. Load models sends a model-list request. Test also sends a short sample prompt to compatible endpoints.</p>
+        <p class="hint">API keys are saved in this browser profile and sent to the configured endpoint. Local server models populate automatically when host access is granted. Load models sends a model-list request. Test also sends a short sample prompt to compatible endpoints.</p>
         <div class="llm-top">
           <label>Active profile <select id="llm-profile-select"></select></label>
           <div class="button-row">
@@ -175,6 +192,21 @@
               <option value="high">High</option>
             </select>
           </label>
+          <p id="llm-thinking-hint" class="hint" hidden></p>
+          <div id="llm-context-section" class="llm-context-section">
+            <p id="llm-context-auto" class="hint" hidden></p>
+            <div id="llm-context-manual" hidden>
+              <label for="llm-context">Context limit (tokens)</label>
+              <div class="context-controls">
+                <div class="context-slider-wrap">
+                  <input id="llm-context-slider" type="range" min="0" max="6" step="1" aria-label="Context limit preset">
+                  <div id="llm-context-ticks" class="context-ticks" aria-hidden="true"></div>
+                </div>
+                <input id="llm-context" type="number" min="1024" max="2097152" step="1" aria-label="Exact context limit in tokens">
+              </div>
+              <p id="llm-context-hint" class="hint"></p>
+            </div>
+          </div>
           <p id="llm-endpoint-hint" class="hint"></p>
         </fieldset>
 

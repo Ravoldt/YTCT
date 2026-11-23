@@ -7,12 +7,19 @@ import { normalizeEntry, normalizeTranscript } from './export-entry.mjs';
 // See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
 import {
   PROVIDER_GROUPS, PROVIDERS, activeProfile, assistantLabel, defaultLlmConfig, defaultProfile,
-  canonicalEndpoint, endpointUrl, isLoopback, maskKey, originPattern, profileDestination, providerOrigin, providerSpec,
+  canonicalEndpoint, contextSteps, effectiveContextWindow, endpointUrl, formatContextLabel,
+  isCloudManagedProvider, isLoopback, maskKey, originPattern, profileDestination, providerOrigin,
+  providerSpec, resolveModelCapabilities,
 } from './llm-config.mjs';
 
 const byId = (id) => document.getElementById(id);
 const tabId = Number(new URLSearchParams(location.search).get('tab'));
 const query = byId('query');
+const askField = byId('ask-field');
+const askInput = byId('ask-input');
+const expandAskBtn = byId('expand-ask');
+const expandAskPath = byId('expand-ask-path');
+const footerEl = document.querySelector('footer');
 const chat = byId('chat');
 const config = byId('settings-form');
 const dialog = byId('settings');
@@ -24,6 +31,7 @@ let job;
 let leaseRequested = false;
 let releasePending = Promise.resolve();
 let mode = 'search';
+let askExpanded = false;
 let searchDraft = '';
 let questionDraft = '';
 let searchTimer;
@@ -38,6 +46,15 @@ let llmTesting = false;
 let llmGrantOrigin = '';
 let llmRevealTimer;
 const llmModelsByProvider = new Map();
+const llmModelMetaByProvider = new Map();
+let llmCurrentSteps = contextSteps(262144, 7);
+let llmCurrentCaps = resolveModelCapabilities('cloud', '');
+let llmCapSeq = 0;
+let llmLocalFetchSeq = 0;
+let llmModelDebounce = null;
+let newCommentsCount = 0;
+let countPollTimer = null;
+let countCheckInFlight = false;
 let settingsTab = 'general';
 let history = [];
 let historyDestination = '';
@@ -61,7 +78,8 @@ function setLlmConfig(next) {
 }
 
 const viewer = new CommentsView({
-  list: byId('comments'), count: byId('count'), follow: byId('follow'), timestampOnly: byId('timestamp-only'),
+  list: byId('comments'), count: byId('count'), follow: byId('follow'),
+  timestampOnly: byId('timestamp-only'), playhead: byId('playhead-time'),
   seek: (seconds) => tab('seek', { seconds }),
 });
 const actions = {
@@ -83,11 +101,11 @@ function applyAssistantName() {
   byId('ai-resize').setAttribute('aria-label', 'Resize ' + label);
   byId('ai-mode').setAttribute('aria-label', label);
   byId('ai-mode').title = label;
-  if (mode === 'ai') {
-    const placeholder = 'Ask ' + name + ' about these comments';
-    query.placeholder = placeholder;
-    query.setAttribute('aria-label', placeholder);
-    if (!job) byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
+  const placeholder = 'Ask ' + name + ' about these comments';
+  askInput.placeholder = placeholder;
+  askInput.setAttribute('aria-label', placeholder);
+  if (mode === 'ai' && !job) {
+    byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
   }
 }
 
@@ -158,41 +176,115 @@ function clearChat() {
   updateComposer();
 }
 
+function resizeAskInput() {
+  if (askExpanded || mode !== 'ai') return;
+  askInput.style.height = 'auto';
+  const style = getComputedStyle(askInput);
+  const lineHeight = parseFloat(style.lineHeight) || (parseFloat(style.fontSize) || 14) * 1.45;
+  const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
+  const borderY = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+  const maxHeight = Math.ceil(lineHeight * 4 + paddingY + borderY);
+  const scrollHeight = askInput.scrollHeight;
+  askInput.style.height = Math.min(scrollHeight, maxHeight) + 'px';
+  askInput.style.overflowY = scrollHeight > maxHeight + 1 ? 'auto' : 'hidden';
+}
+
+function setAskExpanded(expanded) {
+  askExpanded = !!expanded && mode === 'ai';
+  footerEl.classList.toggle('ask-expanded', askExpanded);
+  expandAskBtn.setAttribute('aria-pressed', String(askExpanded));
+  const label = askExpanded ? 'Collapse input' : 'Expand input to full height';
+  expandAskBtn.title = label;
+  expandAskBtn.setAttribute('aria-label', label);
+  expandAskPath.setAttribute('d', askExpanded
+    ? 'M4 14h6v6M20 10h-6V4M14 10l6-6M10 14l-6 6'
+    : 'M15 4h5v5M9 20H4v-5M20 4l-6 6M4 20l6-6');
+  if (!askExpanded) resizeAskInput();
+}
+
 function setMode(next) {
   if (next === mode) return;
   if (mode === 'search') searchDraft = query.value;
-  else questionDraft = query.value;
+  else questionDraft = askInput.value;
   clearTimeout(searchTimer);
   mode = next;
   const ai = mode === 'ai';
+  if (!ai) setAskExpanded(false);
   byId('ai').hidden = !ai;
+  query.hidden = ai;
+  askField.hidden = !ai;
   byId('send').hidden = !ai;
   byId('search-mode').setAttribute('aria-pressed', String(!ai));
   byId('ai-mode').setAttribute('aria-pressed', String(ai));
-  query.type = ai ? 'text' : 'search';
-  query.value = ai ? questionDraft : searchDraft;
-  const name = ai ? 'Ask ' + assistantLabel(llm) + ' about these comments' : 'Search comments';
-  query.placeholder = name;
-  query.setAttribute('aria-label', name);
+  if (ai) askInput.value = questionDraft;
+  else query.value = searchDraft;
   viewer.setQuery(ai ? '' : searchDraft);
   if (!ai) stopAsking();
   else {
-    byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
+    applyAssistantName();
     chat.scrollTop = chat.scrollHeight;
+    resizeAskInput();
+    requestAnimationFrame(resizeAskInput);
   }
   updateComposer();
 }
 
 function updateComposer() {
-  byId('send').disabled = !state?.entry || !!job || !query.value.trim();
+  const value = mode === 'ai' ? askInput.value : query.value;
+  byId('send').disabled = !state?.entry || !!job || !value.trim();
+}
+
+function stopCountPolling() {
+  clearInterval(countPollTimer);
+  countPollTimer = null;
+  newCommentsCount = 0;
+  countCheckInFlight = false;
+}
+
+function countBaseline(entry) {
+  if (!entry) return 0;
+  const reported = Number(entry.snapshot?.reportedCount) || 0;
+  const loaded = YTCT.commentsFromExport(entry).length;
+  return Math.max(reported, loaded);
+}
+
+async function checkNewComments(current) {
+  if (!current || state !== current || !current.entry || current.progress?.running || countCheckInFlight) return;
+  countCheckInFlight = true;
+  try {
+    const result = await tab('check-count');
+    if (state !== current || !current.entry || current.progress?.running) return;
+    const live = Number(typeof result === 'number' ? result : result?.count) || 0;
+    const baseline = countBaseline(current.entry);
+    const diff = live > baseline ? live - baseline : 0;
+    if (diff !== newCommentsCount) {
+      newCommentsCount = diff;
+      updatePageHeader();
+    }
+  } catch {
+    // Ignore transient errors while checking reported comment count.
+  } finally {
+    countCheckInFlight = false;
+  }
+}
+
+function startCountPolling(current, checkImmediately = false) {
+  clearInterval(countPollTimer);
+  countPollTimer = null;
+  if (!current || state !== current || !current.entry) return;
+  if (checkImmediately) checkNewComments(current);
+  countPollTimer = setInterval(() => checkNewComments(current), 60000);
 }
 
 function resetView(info) {
   stopAsking();
+  stopCountPolling();
+  setAskExpanded(false);
   setMode('search');
   searchDraft = '';
   questionDraft = '';
   query.value = '';
+  askInput.value = '';
   history = [];
   historyDestination = '';
   historyHasTranscript = false;
@@ -244,9 +336,15 @@ function updatePageHeader() {
   const limitReached = !!state?.entry?.snapshot?.collection?.limitReached;
   byId('collection').hidden = !state;
   const collectButton = byId('collect');
-  collectButton.textContent = progress.running ? 'Stop' : 'Collect';
+  collectButton.textContent = progress.running ? 'Stop' : state?.entry ? 'Refresh' : 'Collect';
   collectButton.title = progress.running ? 'Stop collecting comments'
-    : state?.entry ? 'Collect comments again' : 'Collect comments';
+    : state?.entry ? 'Check for and collect new comments' : 'Collect comments';
+  const newBadge = byId('new-comments-badge');
+  const showNew = !progress.running && !!state?.entry && newCommentsCount > 0;
+  newBadge.hidden = !showNew;
+  newBadge.textContent = showNew
+    ? '+' + newCommentsCount.toLocaleString() + (newCommentsCount === 1 ? ' New Comment' : ' New Comments')
+    : '';
   const statusEl = byId('collection-status');
   if (progress.running) {
     statusEl.textContent = 'Collecting' + (progress.count ? ' · ' + progress.count.toLocaleString() : '') + '…';
@@ -264,15 +362,18 @@ function updatePageHeader() {
   }
 }
 
-function adoptEntry(entry) {
+function adoptEntry(entry, { checkNow = false } = {}) {
   if (!state || !entry) return;
   const previous = state.entry;
   state.entry = entry;
+  newCommentsCount = 0;
   if (entry.snapshot?.exportedAt !== previous?.snapshot?.exportedAt || entry.markdown !== previous?.markdown || !previous) {
     viewer.load(entry);
   }
   updatePageHeader();
   updateComposer();
+  const collectedAt = YTCT.exportTimestamp(entry)?.getTime() || Date.now();
+  startCountPolling(state, checkNow || Date.now() - collectedAt >= 60000);
 }
 
 function bubble(role, content = '') {
@@ -296,7 +397,9 @@ async function preparePage(current) {
     if (!current.entry) {
       if (collected && collected.snapshot?.exportedAt !== cached?.snapshot?.exportedAt && !cached?.markdown) {
         await receiveEntry(current, collected);
-      } else adoptEntry(cached);
+      } else if (cached) {
+        adoptEntry(cached, { checkNow: true });
+      }
     }
     if (cached) await worker('mark-used', identity);
     if (state !== current) return;
@@ -359,6 +462,9 @@ function accept(message) {
   if (message.event === 'export' && message.pageId === state.pageId) {
     receiveEntry(state, message.entry).catch((error) => notice(error.message));
     if (message.notice) notice(message.notice);
+  }
+  if (message.event === 'export-delta' && message.pageId === state.pageId) {
+    mergeDeltaEntry(state, message.delta).catch((error) => notice(error.message));
   }
 }
 
@@ -569,8 +675,10 @@ async function ask(question) {
   let answerNode;
   let asked;
   let success = false;
-  query.value = '';
+  setAskExpanded(false);
+  askInput.value = '';
   questionDraft = '';
+  resizeAskInput();
   updateComposer();
   const profile = activeLlm();
   try {
@@ -589,6 +697,7 @@ async function ask(question) {
       historyDestination = destination;
       historyHasTranscript = includeTranscript;
     }
+    const contextWindow = effectiveContextWindow(profile, options.contextWindow);
     beginCost(profile);
     let acquired = { resident: null };
     if (profile.provider === 'ollama') {
@@ -597,12 +706,12 @@ async function ask(question) {
       acquired = await worker('model-acquire', { profileId: profile.id, destination });
       signal.throwIfAborted();
       status(acquired.resident ? 'Waiting for Ollama…' : 'Loading ' + profile.model + '…');
-      updateTelemetry(null, options.contextWindow, acquired.resident, profile);
+      updateTelemetry(null, contextWindow, acquired.resident, profile);
     } else {
       if (leaseRequested) await release();
       leaseRequested = false;
       status('Connecting to ' + (PROVIDERS[profile.provider]?.label || profile.provider) + '…');
-      updateTelemetry(null, options.contextWindow, null, profile);
+      updateTelemetry(null, contextWindow, null, profile);
     }
     const entry = current.entry;
     if (includeTranscript && !current.transcript && !current.transcriptTried) {
@@ -619,7 +728,6 @@ async function ask(question) {
       }
     }
     const meta = entry.snapshot?.metadata || { title: current.title, kind: current.key.split(':')[0] };
-    const contextWindow = options.contextWindow;
     const wantsImages = profile.provider === 'ollama' && contextWindow >= 4096;
     const images = wantsImages ? current.images || await sourceImages(meta, signal) : [];
     signal.throwIfAborted();
@@ -641,6 +749,7 @@ async function ask(question) {
       renderAnswer(answerNode, latest, links, actions);
       if (atBottom) chat.scrollTop = chat.scrollHeight;
     }
+    const thinking = profile.thinkingCapabilities?.supported === false ? 'default' : profile.thinking;
     const response = profile.provider === 'ollama'
       ? await askOllama(session, history, question, options, (update) => {
         if (!isCurrent()) return;
@@ -653,7 +762,7 @@ async function ask(question) {
         links = update.links;
         status('Writing answer…');
         if (timer === undefined) timer = setTimeout(display, 75);
-      }, signal, { model: profile.model, thinking: profile.thinking })
+      }, signal, { model: profile.model, thinking })
       : await askRemote(session, history, question, options, profile, (update) => {
         if (!isCurrent()) return;
         if (update.status) status(update.status);
@@ -706,7 +815,10 @@ async function ask(question) {
     clearTimeout(timer);
     if (job === task) {
       job = null;
-      if (!success && !query.value && mode === 'ai') query.value = question;
+      if (!success && !askInput.value && mode === 'ai') {
+        askInput.value = question;
+        resizeAskInput();
+      }
       updateComposer();
     }
   }
@@ -717,11 +829,78 @@ async function collect(fresh = false) {
   if (!current) return;
   try {
     if (current.progress?.running) return await tab('stop');
-    const partial = current.entry?.snapshot?.collection?.status === 'partial';
-    const limitReached = !!current.entry?.snapshot?.collection?.limitReached;
+    const snap = current.entry?.snapshot;
+    const partial = snap?.collection?.status === 'partial';
+    const limitReached = !!snap?.collection?.limitReached;
+    const canIncremental = !fresh && !!snap?.comments?.length && !partial && !limitReached;
+    if (canIncremental) {
+      const knownIds = [];
+      const knownAllIds = [];
+      const storedReplies = Object.create(null);
+      for (const comment of snap.comments) {
+        knownAllIds.push(comment.id);
+        if (comment.parent) storedReplies[comment.parent] = (storedReplies[comment.parent] || 0) + 1;
+        else knownIds.push(comment.id);
+      }
+      const knownReplyCounts = Object.create(null);
+      for (const comment of snap.comments) {
+        if (comment.parent) continue;
+        const count = Math.max(storedReplies[comment.id] || 0, YTCT.parseLikes(comment.replyCount));
+        if (count > 0) knownReplyCounts[comment.id] = count;
+      }
+      await tab('collect', {
+        refresh: true,
+        knownIds,
+        knownAllIds,
+        knownReplyCounts,
+        baselineCount: countBaseline(current.entry),
+      });
+      return;
+    }
     const startFresh = fresh || (!!current.entry && (!partial || limitReached));
     await tab('collect', { fresh: startFresh });
   } catch (error) { if (current === state) notice(error.message); }
+}
+
+async function mergeDeltaEntry(current, delta) {
+  if (state !== current || !current.entry?.snapshot || !delta) return;
+  const base = current.entry.snapshot;
+  const updatedCounts = delta.updatedReplyCounts || {};
+  const existing = new Set((base.comments || []).map((comment) => comment.id));
+  const additions = (delta.comments || []).filter((comment) => comment?.id && !existing.has(comment.id));
+  const updatedBase = (base.comments || []).map((comment) => {
+    const nextReplyCount = updatedCounts[comment.id];
+    return nextReplyCount ? { ...comment, replyCount: nextReplyCount } : comment;
+  });
+  const comments = [...additions, ...updatedBase].slice(0, 50000);
+  const mergedSnapshot = {
+    ...base,
+    metadata: delta.metadata?.title ? { ...base.metadata, ...delta.metadata } : base.metadata,
+    exportedAt: delta.exportedAt || new Date().toISOString(),
+    reportedCount: Math.max(Number(delta.reportedCount) || 0, Number(base.reportedCount) || 0, comments.length),
+    collection: {
+      ...base.collection,
+      status: delta.collection?.status === 'complete' && base.collection?.status === 'complete' ? 'complete' : 'partial',
+      limitReached: !!base.collection?.limitReached || !!delta.collection?.limitReached || comments.length >= 50000,
+    },
+    comments,
+  };
+  const mergedRaw = { ...current.entry, snapshot: mergedSnapshot };
+  newCommentsCount = 0;
+  if (additions.length > 0) {
+    await receiveEntry(current, mergedRaw);
+    if (state === current) {
+      notice(additions.length === 1 ? 'Added 1 new comment.' : 'Added ' + additions.length.toLocaleString() + ' new comments.');
+    }
+  } else {
+    const normalized = normalizeEntry(current.key, mergedRaw);
+    if (state !== current) return;
+    current.entry = normalized;
+    updatePageHeader();
+    startCountPolling(current, false);
+    worker('write-cache', { key: current.key, pageId: current.pageId, entry: normalized }).catch(() => {});
+    notice('No new comments found.');
+  }
 }
 
 async function receiveEntry(current, raw) {
@@ -740,14 +919,14 @@ async function loadSavedExport() {
     const entry = await worker('read-cache', identity);
     if (state !== current) return;
     if (!entry) return settingsError('There is no saved export for this source.');
-    adoptEntry(entry);
+    adoptEntry(entry, { checkNow: true });
     await worker('mark-used', identity);
     closeSettings();
   } catch (error) { settingsError(error.message); }
 }
 
 async function clearSavedExports() {
-  if (!window.confirm('Delete all saved comment exports from this Chrome profile?')) return;
+  if (!window.confirm('Delete all saved comment exports from this browser profile?')) return;
   try {
     await worker('clear-cache');
     byId('cache-usage').textContent = 'Saved exports cleared.';
@@ -760,15 +939,17 @@ async function showSettings() {
     settings = value.settings;
     for (const [name, setting] of Object.entries(settings)) {
       const input = config.elements.namedItem(name);
+      if (!input) continue;
       if (input.type === 'checkbox') input.checked = setting;
       else input.value = setting;
     }
     const mb = value.bytes / 1000000;
     byId('cache-usage').textContent = (mb > 0 && mb < .1 ? '<0.1' : mb.toFixed(1)) + ' MB of ' + settings.cacheMB + ' MB used';
     byId('font-scale-value').textContent = settings.fontScale + '%';
-    config.elements.namedItem('replyBatch').disabled = settings.allReplies;
+    config.elements.namedItem('stackWindow').disabled = !settings.stackComments;
     byId('settings-error').hidden = true;
-    await loadLlmConfig();    llmEditingId = activeLlm()?.id || null;
+    await loadLlmConfig();
+    llmEditingId = activeLlm()?.id || null;
     llmNewDraft = null;
     llmDirty = false;
     llmKeyClear = false;
@@ -783,9 +964,10 @@ async function showSettings() {
 
 async function saveSettings(event) {
   event.preventDefault();
-  const values = {};
+  const values = { ...settings };
   for (const name of Object.keys(YTCT.settingsDefaults)) {
     const input = config.elements.namedItem(name);
+    if (!input) continue;
     values[name] = input.type === 'checkbox' ? input.checked : input.value;
   }
   try {
@@ -862,7 +1044,177 @@ function updateModelDatalist(provider = byId('llm-provider').value) {
   }));
 }
 
-function applyModels(models, provider) {
+const THINKING_LABELS = {
+  default: 'Default (model setting)',
+  off: 'Off',
+  on: 'On',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+};
+
+function storeModelMeta(provider, modelMeta) {
+  if (!provider || !modelMeta || typeof modelMeta !== 'object') return;
+  let map = llmModelMetaByProvider.get(provider);
+  if (!map) {
+    map = new Map();
+    llmModelMetaByProvider.set(provider, map);
+  }
+  for (const [id, meta] of Object.entries(modelMeta)) {
+    if (id && meta) map.set(id, meta);
+  }
+}
+
+function cachedModelMeta(provider, modelId) {
+  const map = llmModelMetaByProvider.get(provider);
+  if (!map || !modelId) return null;
+  return map.get(modelId) || map.get(modelId + ':latest') || null;
+}
+
+function nearestStepIndex(steps, value) {
+  let best = 0;
+  let bestDiff = Infinity;
+  for (let i = 0; i < steps.length; i++) {
+    const diff = Math.abs(steps[i] - value);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      best = i;
+    }
+  }
+  return best;
+}
+
+function renderThinkingControls(caps, preferredValue = null) {
+  const select = byId('llm-thinking');
+  const hint = byId('llm-thinking-hint');
+  const previous = preferredValue ?? select.value ?? 'default';
+  const thinking = caps?.thinking || { supported: null, levels: ['default', 'off', 'low', 'medium', 'high'] };
+  const levels = thinking.levels?.length ? thinking.levels : ['default'];
+  select.replaceChildren(...levels.map((level) => new Option(THINKING_LABELS[level] || level, level)));
+  select.value = levels.includes(previous) ? previous : 'default';
+  select.disabled = thinking.supported === false || levels.length <= 1;
+  if (thinking.supported === false) {
+    hint.textContent = 'This model does not support configurable thinking.';
+    hint.hidden = false;
+  } else if (thinking.supported === true && levels.length <= 1) {
+    hint.textContent = 'Thinking is controlled automatically by this model.';
+    hint.hidden = false;
+  } else {
+    hint.textContent = '';
+    hint.hidden = true;
+  }
+}
+
+function renderContextControls(provider, caps, preferredValue = null) {
+  const autoBox = byId('llm-context-auto');
+  const manualBox = byId('llm-context-manual');
+  const slider = byId('llm-context-slider');
+  const input = byId('llm-context');
+  const ticks = byId('llm-context-ticks');
+  const hint = byId('llm-context-hint');
+  const maxCtx = caps?.contextLength || 0;
+  if (isCloudManagedProvider(provider)) {
+    manualBox.hidden = true;
+    autoBox.hidden = false;
+    autoBox.textContent = maxCtx
+      ? 'Context limit: automatic from model capabilities (' + formatContextLabel(maxCtx) + ' / ' + maxCtx.toLocaleString() + ' tokens).'
+      : 'Context limit: automatic from model capabilities.';
+    return;
+  }
+  autoBox.hidden = true;
+  manualBox.hidden = false;
+  const sliderTop = maxCtx || 262144;
+  llmCurrentSteps = contextSteps(sliderTop, 7);
+  const maxBound = maxCtx || 2097152;
+  const raw = preferredValue ?? Number(input.value) ?? 32768;
+  const clamped = Math.max(1024, Math.min(maxBound, Math.floor(Number(raw) || 32768)));
+  input.min = '1024';
+  input.max = String(maxBound);
+  input.value = String(clamped);
+  slider.min = '0';
+  slider.max = String(Math.max(0, llmCurrentSteps.length - 1));
+  slider.disabled = llmCurrentSteps.length <= 1;
+  slider.value = String(nearestStepIndex(llmCurrentSteps, clamped));
+  const count = llmCurrentSteps.length;
+  ticks.replaceChildren(...llmCurrentSteps.map((step, index) => {
+    const span = document.createElement('span');
+    span.textContent = formatContextLabel(step);
+    span.title = step.toLocaleString() + ' tokens';
+    span.style.left = (count > 1 ? (index / (count - 1)) * 100 : 50) + '%';
+    span.addEventListener('click', () => {
+      slider.value = String(index);
+      input.value = String(step);
+      llmDirty = true;
+    });
+    return span;
+  }));
+  hint.textContent = maxCtx
+    ? 'Model maximum: ' + formatContextLabel(maxCtx) + ' (' + maxCtx.toLocaleString() + ' tokens). Drag the slider or enter an exact token limit.'
+    : 'Drag the slider for power-of-two stops or enter an exact token limit.';
+}
+
+async function refreshModelCapabilities({ queryApi = true, preferredContext = null, preferredThinking = null, fallbackCaps = null } = {}) {
+  const provider = byId('llm-provider').value || 'cloud';
+  const model = byId('llm-model').value.trim();
+  const endpoint = byId('llm-endpoint').value.trim();
+  const cached = cachedModelMeta(provider, model);
+  const resolved = resolveModelCapabilities(provider, model, cached || fallbackCaps);
+  llmCurrentCaps = resolved;
+  renderThinkingControls(resolved, preferredThinking);
+  renderContextControls(provider, resolved, preferredContext);
+  if (!queryApi || !model || !endpoint) return;
+  const needsDetail = provider === 'ollama' || provider === 'gemini' || provider === 'llamacpp' || provider === 'lmstudio';
+  if (!needsDetail) return;
+  const seq = ++llmCapSeq;
+  if (!await hasHostAccess(endpoint)) return;
+  if (seq !== llmCapSeq) return;
+  try {
+    const values = readLlmForm();
+    const result = await worker('llm-model-info', testPayload(values));
+    if (seq !== llmCapSeq || byId('llm-provider').value !== provider || byId('llm-model').value.trim() !== model) return;
+    if (result?.capabilities) {
+      storeModelMeta(provider, { [model]: result.capabilities });
+      llmCurrentCaps = result.capabilities;
+      renderThinkingControls(result.capabilities);
+      renderContextControls(provider, result.capabilities);
+    }
+  } catch {
+    // Keep resolved fallback capabilities if the optional detail query fails.
+  }
+}
+
+async function autoPopulateLocalModels(provider = byId('llm-provider').value) {
+  const spec = providerSpec(provider);
+  if (!spec.local) return;
+  const endpoint = byId('llm-endpoint').value.trim() || spec.defaultEndpoint;
+  if (!endpoint) return;
+  const seq = ++llmLocalFetchSeq;
+  if (!await hasHostAccess(endpoint)) return;
+  if (seq !== llmLocalFetchSeq || byId('llm-provider').value !== provider) return;
+  const values = readLlmForm();
+  const saved = llmEditingId ? llm.profiles.find((row) => row.id === llmEditingId) : null;
+  const hasKey = !!values.key.trim() || (!!saved?.hasKey && !llmKeyClear && !llmProviderChanged);
+  if (spec.keyRequired && !hasKey) return;
+  setModelStatus('Loading local models…');
+  try {
+    const result = await worker('llm-models', testPayload(values));
+    if (seq !== llmLocalFetchSeq || byId('llm-provider').value !== provider) return;
+    const models = applyModels(result.models, result.provider || provider, result.modelMeta);
+    const modelInput = byId('llm-model');
+    if (!modelInput.value.trim() && models.length) modelInput.value = models[0];
+    if (!noteModelChoice(models)) {
+      setModelStatus(models.length
+        ? 'Found ' + models.length + ' local model' + (models.length === 1 ? '' : 's') + '.'
+        : 'No local models reported yet.');
+    }
+    await refreshModelCapabilities({ queryApi: true });
+  } catch {
+    if (seq === llmLocalFetchSeq && byId('llm-provider').value === provider) setModelStatus('');
+  }
+}
+
+function applyModels(models, provider, modelMeta = null) {
+  if (modelMeta) storeModelMeta(provider, modelMeta);
   const list = [...new Set((models || []).filter((id) => typeof id === 'string' && id.trim()).map((id) => id.trim()))];
   if (list.length) llmModelsByProvider.set(provider, list);
   updateModelDatalist();
@@ -890,7 +1242,7 @@ function hideGrant() {
 function showGrant(origin) {
   if (!origin) return;
   llmGrantOrigin = origin;
-  byId('llm-grant-text').textContent = 'Chrome needs one-time network access to ' + origin
+  byId('llm-grant-text').textContent = 'The browser needs one-time network access to ' + origin
     + ' for this endpoint. This grants access to that host only.';
   byId('llm-grant').hidden = false;
 }
@@ -961,7 +1313,6 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-provider').value = provider;
   byId('llm-endpoint').value = draft.endpoint || spec.defaultEndpoint;
   byId('llm-model').value = draft.model || '';
-  byId('llm-thinking').value = draft.thinking || 'default';
   byId('llm-input-price').value = draft.pricing?.input ?? 0;
   byId('llm-output-price').value = draft.pricing?.output ?? 0;
   byId('llm-assistant-name').value = draft.name || '';
@@ -982,11 +1333,23 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-clear-key').disabled = !saved;
   updateLlmProviderUi();
   if (saved) byId('llm-key').placeholder = 'Leave blank to keep ' + maskKey(draft.keyHint);
-  if (!isNew) {
-    const endpoint = byId('llm-endpoint').value;
+  refreshModelCapabilities({
+    queryApi: !isNew || spec.local,
+    preferredContext: draft.contextWindow || 32768,
+    preferredThinking: draft.thinking || 'default',
+    fallbackCaps: {
+      contextLength: draft.maxContext || 0,
+      thinking: draft.thinkingCapabilities || null,
+    },
+  });
+  const endpoint = byId('llm-endpoint').value;
+  if (endpoint && (!isNew || spec.local)) {
     hasHostAccess(endpoint).then((allowed) => {
-      if (!allowed && llmEditingId === draft.id && byId('llm-endpoint').value === endpoint) {
-        showGrant(providerOrigin({ endpoint }));
+      if (byId('llm-provider').value !== provider || byId('llm-endpoint').value !== endpoint) return;
+      if (!allowed) {
+        if (isNew || llmEditingId === draft.id) showGrant(providerOrigin({ endpoint }));
+      } else if (spec.local) {
+        autoPopulateLocalModels(provider);
       }
     });
   }
@@ -1077,6 +1440,16 @@ function applyProviderChange() {
   updateLlmProviderUi();
   setModelStatus('');
   hideGrant();
+  refreshModelCapabilities({ queryApi: false, preferredContext: 32768, preferredThinking: 'default' });
+  if (spec.local && spec.defaultEndpoint) {
+    hasHostAccess(spec.defaultEndpoint).then((allowed) => {
+      if (byId('llm-provider').value !== provider) return;
+      if (allowed) autoPopulateLocalModels(provider);
+      else showGrant(providerOrigin({ endpoint: spec.defaultEndpoint }));
+    });
+  } else if (spec.defaultEndpoint && byId('llm-model').value.trim()) {
+    refreshModelCapabilities({ queryApi: true });
+  }
   llmDirty = true;
 }
 
@@ -1090,6 +1463,9 @@ function draftProfileForTest(values) {
     endpoint: values.endpoint,
     model: values.model || spec.defaultModel,
     thinking: values.thinking,
+    contextWindow: values.contextWindow,
+    maxContext: values.maxContext,
+    thinkingCapabilities: values.thinkingCapabilities,
     pricing: values.pricing,
   };
 }
@@ -1114,7 +1490,7 @@ async function loadModels() {
   setModelStatus('Loading models…');
   try {
     const result = await worker('llm-models', testPayload(values));
-    const models = applyModels(result.models, result.provider || values.provider);
+    const models = applyModels(result.models, result.provider || values.provider, result.modelMeta);
     if (!byId('llm-model').value && models.length) byId('llm-model').value = models[0];
     const warned = noteModelChoice(models);
     if (!warned) {
@@ -1123,6 +1499,7 @@ async function loadModels() {
         : 'No models returned. Enter a model ID manually.');
     }
     setLlmStatus('Model list loaded from ' + providerSpec(values.provider).label + '.');
+    await refreshModelCapabilities({ queryApi: true });
   } catch (error) {
     setModelStatus(error.message, true);
     setLlmStatus(error.message, true);
@@ -1146,12 +1523,13 @@ async function testConnection() {
   setLlmStatus('Testing ' + providerSpec(values.provider).label + '…');
   try {
     const result = await worker('llm-test', testPayload(values));
-    applyModels(result.models, result.provider || values.provider);
+    applyModels(result.models, result.provider || values.provider, result.modelMeta);
     if (!byId('llm-model').value && result.models?.length) byId('llm-model').value = result.models[0];
     setModelStatus(result.mode === 'chat'
       ? 'The selected model answered a test request.'
       : 'Ollama is reachable and lists the selected model.');
     setLlmStatus('Connected to ' + providerSpec(values.provider).label + '.');
+    await refreshModelCapabilities({ queryApi: true });
   } catch (error) {
     setLlmStatus(error.message, true);
     if (/host access/i.test(error.message)) showGrant(providerOrigin({ endpoint: values.endpoint }));
@@ -1175,12 +1553,18 @@ function readLlmForm() {
   const provider = byId('llm-provider').value;
   let endpoint = byId('llm-endpoint').value.trim();
   if (provider === 'ollama') endpoint = 'http://127.0.0.1:11434';
+  const contextWindow = isCloudManagedProvider(provider)
+    ? 0
+    : Math.max(1024, Math.floor(Number(byId('llm-context').value) || 32768));
   return {
     provider,
     endpoint,
     label: byId('llm-label').value.trim(),
     model: byId('llm-model').value.trim(),
-    thinking: byId('llm-thinking').value,
+    thinking: byId('llm-thinking').value || 'default',
+    contextWindow,
+    maxContext: llmCurrentCaps?.contextLength || 0,
+    thinkingCapabilities: llmCurrentCaps?.thinking || undefined,
     pricing: {
       input: Math.max(0, Number(byId('llm-input-price').value) || 0),
       output: Math.max(0, Number(byId('llm-output-price').value) || 0),
@@ -1213,6 +1597,9 @@ async function saveLlm() {
         endpoint: values.endpoint,
         model: values.model,
         thinking: values.thinking,
+        contextWindow: values.contextWindow,
+        maxContext: values.maxContext,
+        thinkingCapabilities: values.thinkingCapabilities,
         pricing: values.pricing,
       },
       key: values.key.trim() || undefined,
@@ -1391,10 +1778,17 @@ askHandle.addEventListener('keydown', (event) => {
   if (event.key === 'ArrowUp') { setAskHeight(askHeight + step, true); event.preventDefault(); }
   else if (event.key === 'ArrowDown') { setAskHeight(askHeight - step, true); event.preventDefault(); }
 });
-window.addEventListener('resize', () => setAskHeight(askHeight));
+window.addEventListener('resize', () => {
+  setAskHeight(askHeight);
+  resizeAskInput();
+});
 
 byId('search-mode').addEventListener('click', () => setMode('search'));
 byId('ai-mode').addEventListener('click', () => setMode('ai'));
+expandAskBtn.addEventListener('click', () => {
+  setAskExpanded(!askExpanded);
+  askInput.focus();
+});
 byId('collect').addEventListener('click', () => collect());
 byId('clear-chat').addEventListener('click', () => { approvedScopes.clear(); clearChat(); });
 byId('load-saved-export').addEventListener('click', loadSavedExport);
@@ -1407,6 +1801,7 @@ dialog.addEventListener('close', () => {
   // Undo any unsaved scale preview.
   byId('font-scale-value').textContent = settings.fontScale + '%';
   viewer.setScale(settings.fontScale);
+  resizeAskInput();
   // Never leave a revealed key in the DOM after the dialog closes.
   clearLlmKeyReveal();
   byId('llm-key').value = '';
@@ -1414,8 +1809,9 @@ dialog.addEventListener('close', () => {
 config.elements.namedItem('fontScale').addEventListener('input', (event) => {
   byId('font-scale-value').textContent = event.target.value + '%';
   viewer.setScale(Number(event.target.value));
+  resizeAskInput();
 });
-config.elements.namedItem('allReplies').addEventListener('change', (event) => { config.elements.namedItem('replyBatch').disabled = event.target.checked; });
+config.elements.namedItem('stackComments').addEventListener('change', (event) => { config.elements.namedItem('stackWindow').disabled = !event.target.checked; });
 config.addEventListener('submit', (event) => {
   if (settingsTab === 'llm') {
     event.preventDefault();
@@ -1441,6 +1837,37 @@ for (const tab of [byId('settings-tab-general'), byId('settings-tab-llm')]) {
 byId('settings-llm').addEventListener('input', () => { llmDirty = true; });
 byId('settings-llm').addEventListener('change', () => { llmDirty = true; });
 byId('llm-provider').addEventListener('change', applyProviderChange);
+byId('llm-model').addEventListener('input', () => {
+  clearTimeout(llmModelDebounce);
+  llmModelDebounce = setTimeout(() => refreshModelCapabilities({ queryApi: true }), 250);
+});
+byId('llm-model').addEventListener('change', () => {
+  clearTimeout(llmModelDebounce);
+  refreshModelCapabilities({ queryApi: true });
+});
+byId('llm-context-slider').addEventListener('input', () => {
+  const step = llmCurrentSteps[Number(byId('llm-context-slider').value)];
+  if (step) byId('llm-context').value = String(step);
+  llmDirty = true;
+});
+byId('llm-context').addEventListener('input', () => {
+  const value = Number(byId('llm-context').value);
+  if (Number.isFinite(value) && value >= 1024) {
+    byId('llm-context-slider').value = String(nearestStepIndex(llmCurrentSteps, value));
+  }
+  llmDirty = true;
+});
+byId('llm-context').addEventListener('change', () => {
+  const input = byId('llm-context');
+  const maxBound = Number(input.max) || 2097152;
+  const clamped = Math.max(1024, Math.min(maxBound, Math.floor(Number(input.value) || 32768)));
+  input.value = String(clamped);
+  byId('llm-context-slider').value = String(nearestStepIndex(llmCurrentSteps, clamped));
+});
+byId('llm-endpoint').addEventListener('change', () => {
+  const provider = byId('llm-provider').value;
+  if (providerSpec(provider).local) autoPopulateLocalModels(provider);
+});
 byId('llm-endpoint').addEventListener('input', () => {
   if (llmGrantOrigin && providerOrigin({ endpoint: byId('llm-endpoint').value }) !== llmGrantOrigin) hideGrant();
   clearLlmKeyReveal();
@@ -1474,7 +1901,13 @@ chrome.permissions.onAdded.addListener(async () => {
   const origin = llmGrantOrigin;
   if (!origin || !await hasHostAccess(origin) || llmGrantOrigin !== origin) return;
   hideGrant();
-  setLlmStatus('Access granted for ' + origin + '. Choose Test to check the connection.');
+  const provider = byId('llm-provider').value;
+  if (providerSpec(provider).local && providerOrigin({ endpoint: byId('llm-endpoint').value }) === origin) {
+    setLlmStatus('Access granted for ' + origin + '. Loading local models…');
+    autoPopulateLocalModels(provider);
+  } else {
+    setLlmStatus('Access granted for ' + origin + '. Choose Test to check the connection.');
+  }
 });
 byId('llm-profile-select').addEventListener('change', (event) => {
   if (!event.target.value) newLlmProfile();
@@ -1518,9 +1951,24 @@ query.addEventListener('input', () => {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(() => viewer.setQuery(query.value), 100);
 });
+askInput.addEventListener('input', () => {
+  resizeAskInput();
+  updateComposer();
+});
+askInput.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && askExpanded) {
+    event.preventDefault();
+    setAskExpanded(false);
+    return;
+  }
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    if (!byId('send').disabled) ask(askInput.value.trim());
+  }
+});
 byId('composer').addEventListener('submit', (event) => {
   event.preventDefault();
-  if (mode === 'ai') ask(query.value.trim());
+  if (mode === 'ai') ask(askInput.value.trim());
   else viewer.setQuery(query.value);
 });
 
@@ -1536,6 +1984,7 @@ chrome.tabs.onUpdated.addListener((id, change) => { if (id === tabId && change.s
 chrome.tabs.onRemoved.addListener((id) => { if (id === tabId) window.close(); });
 window.addEventListener('pagehide', () => {
   closing = true;
+  stopCountPolling();
   clearLlmKeyReveal();
   byId('llm-key').value = '';
   stopAsking();

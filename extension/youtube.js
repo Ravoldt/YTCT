@@ -65,6 +65,15 @@
       lastGainAt: 0,
       statusText: 'idle',
       errors: [],
+      incremental: false,
+      knownTopIds: null,
+      knownAllIds: null,
+      knownReplyCounts: null,
+      baselineCount: 0,
+      overlapStreak: 0,
+      overlapReached: false,
+      replyScanPages: 0,
+      updatedReplyCounts: null,
       result: { status: 'idle', reason: 'collection has not run' },
     };
   }
@@ -73,6 +82,7 @@
   let collectionSource = sourceKey();
   let sourceGeneration = 0;
   let activeCollection = null;
+  let savedSeedToken = null;
 
   function sleep(ms, signal) {
     if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
@@ -138,6 +148,7 @@
     activeCollection = null;
     collectionSource = key;
     sourceGeneration++;
+    savedSeedToken = null;
     Object.assign(state, createCollectionState());
     resetMetadata();
     updateProgressUI(true);
@@ -207,6 +218,10 @@
       if (!p?.properties || (fromCapture && p.properties.replyLevel > 0)) continue;
       const cid = p.properties.commentId;
       if (!cid || state.comments.has(cid)) continue;
+      if (state.incremental) {
+        if (!parentId && state.knownTopIds?.has(cid)) continue;
+        if (parentId && state.knownAllIds?.has(cid)) continue;
+      }
       const comment = {
         id: cid,
         parent: parentId || null,
@@ -357,28 +372,28 @@
     state.sortApplied = newest.title;
   }
 
-  function ingest(data, parentId, endpoint, fromCapture, items = continuationItems(data)) {
-    const ep = endpoint || defaultEndpoint();
-    const added = harvestEntities(data, parentId, fromCapture);
-    if (items.length) {
-      if (parentId) state.stats.replyPages++;
-      else state.stats.topPages++;
-      for (const t of collectTokens(items, parentId, ep)) {
-        if (fromCapture && !parentId && !t.parent && state.switchedFromTop) continue;
-        pushToken(t.token, parentId || t.parent, t.endpoint);
+  function extractHeaderCount(data) {
+    let count = 0;
+    (function find(node, depth) {
+      if (count > 0 || !node || typeof node !== 'object' || depth > 50) return;
+      const header = node.commentsHeaderRenderer;
+      if (header) {
+        const text = runsToText(header.countText) || runsToText(header.commentsCount);
+        const parsed = parseCountText(text);
+        if (parsed > 0) { count = parsed; return; }
       }
-    }
-    if (!parentId && !state.sortRequested) applySortSwitch(detectSort(data, ep));
-    return added;
+      const entryPoint = node.commentsEntryPointHeaderRenderer;
+      if (entryPoint) {
+        const parsed = parseCountText(runsToText(entryPoint.commentCount));
+        if (parsed > 0) { count = parsed; return; }
+      }
+      for (const k in node) find(node[k], depth + 1);
+    })(data, 0);
+    return count;
   }
 
-  function seedFromInitialData() {
-    const key = collectionSource;
-    const id = key.startsWith('video:') ? key.slice(6) : '';
-    const data = !id || pageWin.ytInitialPlayerResponse?.videoDetails?.videoId === id
-      ? watchResponseFor(id) || pageWin.ytInitialData : watchResponseFor(id);
-    const endpoint = defaultEndpoint();
-    let count = 0;
+  function extractCommentTokensFromData(data, endpoint) {
+    const tokens = [];
     (function walk(node, depth) {
       if (!node || typeof node !== 'object' || depth > 80) return;
       const section = node.itemSectionRenderer;
@@ -387,14 +402,159 @@
         || section.contents.some((item) => item?.commentThreadRenderer)
       )) {
         for (const token of collectTokens(section.contents, null, endpoint)) {
-          pushToken(token.token, token.parent, token.endpoint);
-          count++;
+          tokens.push(token);
         }
       }
       for (const value of Object.values(node)) walk(value, depth + 1);
     })(data, 0);
+    return tokens;
+  }
+
+  function findInitialSeedTokens() {
+    const key = collectionSource;
+    const id = key.startsWith('video:') ? key.slice(6) : '';
+    const data = !id || pageWin.ytInitialPlayerResponse?.videoDetails?.videoId === id
+      ? watchResponseFor(id) || pageWin.ytInitialData : watchResponseFor(id);
+    const endpoint = defaultEndpoint();
+    const tokens = extractCommentTokensFromData(data, endpoint);
+    if (tokens.length && !savedSeedToken) savedSeedToken = tokens[0];
+    return { tokens, data, endpoint };
+  }
+
+  function purgeTopQueue() {
+    for (const queued of state.queue) {
+      if (!queued.parent) state.queuedKeys.delete(queued.key);
+    }
+    state.queue = state.queue.filter((queued) => queued.parent);
+  }
+
+  function expectedNewComments() {
+    return state.baselineCount > 0 && state.reported > state.baselineCount
+      ? state.reported - state.baselineCount : 0;
+  }
+
+  function ingest(data, parentId, endpoint, fromCapture, items = continuationItems(data)) {
+    const ep = endpoint || defaultEndpoint();
+    if (!parentId) {
+      const headerCount = extractHeaderCount(data);
+      if (headerCount > 0) state.reported = headerCount;
+      if (!state.sortRequested) applySortSwitch(detectSort(data, ep));
+      if (state.incremental && state.switchedFromTop && !state.sortConfirmed) return 0;
+    }
+    const updatedReplyIds = new Set();
+    if (state.incremental && !parentId && state.knownTopIds) {
+      const liveReplyCounts = new Map();
+      for (const m of commentMutations(data)) {
+        const p = m?.payload?.commentEntityPayload;
+        const cid = p?.properties?.commentId;
+        if (cid && !p.properties.replyLevel) {
+          const raw = String(p.toolbar?.replyCount || '').trim();
+          liveReplyCounts.set(cid, { count: parseCountText(raw), raw });
+        }
+      }
+      for (const item of items) {
+        const thread = item.commentThreadRenderer;
+        if (!thread) continue;
+        const tid = threadIdOf(thread);
+        if (!tid || !state.knownTopIds.has(tid)) continue;
+        let info = liveReplyCounts.get(tid);
+        if (!info || !info.count) {
+          const rep = thread.replies?.commentRepliesRenderer;
+          const label = runsToText(rep?.viewReplies?.buttonRenderer?.text) || runsToText(rep?.moreText) || '';
+          const parsed = parseCountText(label);
+          if (parsed > 0) info = { count: parsed, raw: String(parsed) };
+        }
+        const knownCount = state.knownReplyCounts?.get(tid) || 0;
+        if (info && info.count > knownCount) {
+          updatedReplyIds.add(tid);
+          if (state.updatedReplyCounts && info.raw) state.updatedReplyCounts[tid] = info.raw;
+        }
+      }
+    }
+    const added = harvestEntities(data, parentId, fromCapture);
+    if (items.length) {
+      if (parentId) state.stats.replyPages++;
+      else state.stats.topPages++;
+      let stopTop = false;
+      if (state.incremental && !parentId && state.knownTopIds) {
+        if (!state.overlapReached) {
+          for (const item of items) {
+            if (!item.commentThreadRenderer) continue;
+            const tid = threadIdOf(item.commentThreadRenderer);
+            if (!tid) continue;
+            if (state.knownTopIds.has(tid)) {
+              state.overlapStreak++;
+              if (state.overlapStreak >= 5) {
+                state.overlapReached = true;
+                break;
+              }
+            } else {
+              state.overlapStreak = 0;
+            }
+          }
+        }
+        const expected = expectedNewComments();
+        const satisfied = expected === 0 || state.comments.size >= expected;
+        if (state.overlapReached && !satisfied) state.replyScanPages++;
+        stopTop = state.overlapReached && (satisfied || state.replyScanPages > 25);
+        if (stopTop) purgeTopQueue();
+      }
+      for (const t of collectTokens(items, parentId, ep)) {
+        if (fromCapture && !parentId && !t.parent && state.switchedFromTop) continue;
+        if (state.incremental && !parentId) {
+          if (!t.parent && stopTop) continue;
+          if (t.parent && state.knownTopIds?.has(t.parent) && !updatedReplyIds.has(t.parent)) continue;
+        }
+        pushToken(t.token, parentId || t.parent, t.endpoint);
+      }
+    }
+    return added;
+  }
+
+  function seedFromInitialData() {
+    const { tokens, data, endpoint } = findInitialSeedTokens();
+    let count = 0;
+    for (const token of tokens) {
+      pushToken(token.token, token.parent, token.endpoint);
+      count++;
+    }
     if (!state.sortRequested && data) applySortSwitch(detectSort(data, endpoint));
     return count;
+  }
+
+  async function checkReportedCount() {
+    const key = collectionSource;
+    const cfg = getConfig();
+    if (!cfg) return { count: readReportedCount() };
+    const signal = AbortSignal.timeout(10000);
+    const seed = savedSeedToken || findInitialSeedTokens().tokens[0];
+    if (seed) {
+      try {
+        const data = await fetchPage(cfg, seed.token, seed.endpoint, signal);
+        if (sourceKey() !== key) return { count: 0 };
+        const count = extractHeaderCount(data);
+        if (count > 0) return { count };
+      } catch {}
+    }
+    if (key.startsWith('video:')) {
+      try {
+        const data = await youtubePost(cfg, 'next', { videoId: key.slice(6) }, signal);
+        if (sourceKey() !== key) return { count: 0 };
+        const freshTokens = extractCommentTokensFromData(data, 'next');
+        if (freshTokens.length) {
+          savedSeedToken = freshTokens[0];
+          try {
+            const headerData = await fetchPage(cfg, freshTokens[0].token, freshTokens[0].endpoint, signal);
+            if (sourceKey() !== key) return { count: 0 };
+            const exact = extractHeaderCount(headerData);
+            if (exact > 0) return { count: exact };
+          } catch {}
+        }
+        const count = extractHeaderCount(data);
+        if (count > 0) return { count };
+      } catch {}
+    }
+    return { count: readReportedCount() };
   }
 
   function getConfig() {
@@ -459,7 +619,9 @@
     } else {
       const top = state.queue.findIndex((entry) => !entry.parent);
       const reply = state.queue.findIndex((entry) => entry.parent);
-      const takeTop = top >= 0 && (reply < 0 || state.topStreak < 6);
+      const takeTop = state.incremental && state.overlapReached
+        ? (reply < 0 && top >= 0)
+        : (top >= 0 && (reply < 0 || state.topStreak < 6));
       index = takeTop ? top : reply;
       state.topStreak = takeTop ? state.topStreak + 1 : 0;
     }
@@ -545,6 +707,25 @@
       const cfg = getConfig();
       if (!cfg) throw new Error('could not read ytcfg — reload the page');
 
+      // Seed tokens without scrolling the YouTube page whenever initial data or a cached seed is available.
+      if (!state.queue.length) seedFromInitialData();
+      if (!state.queue.length && savedSeedToken) {
+        pushToken(savedSeedToken.token, savedSeedToken.parent, savedSeedToken.endpoint);
+      }
+      if (!state.queue.length && collectionSource.startsWith('video:')) {
+        try {
+          const freshData = await youtubePost(cfg, 'next', { videoId: collectionSource.slice(6) }, signal);
+          if (!isCurrentCollection(job)) return;
+          const freshTokens = extractCommentTokensFromData(freshData, 'next');
+          if (freshTokens.length) {
+            savedSeedToken = freshTokens[0];
+            for (const token of freshTokens) pushToken(token.token, token.parent, token.endpoint);
+            if (!state.sortRequested) applySortSwitch(detectSort(freshData, 'next'));
+          }
+        } catch (error) {
+          signal.throwIfAborted();
+        }
+      }
       if (!job.background && !state.queue.length && !state.comments.size) {
         const section = document.querySelector('ytd-comment-section-renderer, #comments');
         if (section) section.scrollIntoView({ block: 'center' });
@@ -555,10 +736,10 @@
           window.scrollBy(0, 600);
           await sleep(2500, signal);
         }
+        if (!state.queue.length) seedFromInitialData();
       }
 
       if (!isCurrentCollection(job)) return;
-      if (!state.queue.length) seedFromInitialData();
       if (!state.queue.length) throw new Error('no comment tokens found — scroll to the comments, then retry');
 
       while (state.queue.length) {
@@ -582,24 +763,29 @@
           throw new Error('unexpected ' + (entry.parent ? 'reply' : 'comment') + ' response on /' + entry.endpoint);
         }
 
+        if (entry.isSort) state.sortConfirmed = true;
         const previousSort = !entry.parent && !entry.isSort && !alreadySwitched && state.switchedFromTop;
         const added = ingest(data, entry.parent, entry.endpoint, previousSort, items);
         if (entry.parent) queueReplyFallback(data, entry);
-        if (entry.isSort) state.sortConfirmed = true;
         state.requests++;
         state.seenTokens.add(entry.key);
         state.queuedKeys.delete(entry.key);
         entry = null;
 
         if (added) state.lastGainAt = state.attempts;
+        if (state.incremental && state.overlapReached) {
+          const expected = expectedNewComments();
+          if (expected === 0 || state.comments.size >= expected) purgeTopQueue();
+        }
         idle = added || emptyReply ? 0 : idle + 1;
         updateProgressUI();
         if (state.limitReached) {
           stopReason = 'Comment export reached its size limit';
           break;
         }
-        if (idle > 15 && state.queue.length) {
-          stopReason = 'no new comments in 16 consecutive pages';
+        const idleLimit = state.incremental && state.overlapReached ? 30 : 15;
+        if (idle > idleLimit && state.queue.length) {
+          stopReason = 'no new comments in ' + (idleLimit + 1) + ' consecutive pages';
           break;
         }
         if (state.queue.length) await sleep(DELAY_MS, signal);
@@ -862,6 +1048,8 @@
       exportedAt: new Date().toISOString(),
       startedAt: state.startedAt?.toISOString() || null,
       reportedCount: state.reported,
+      ...(state.updatedReplyCounts && Object.keys(state.updatedReplyCounts).length
+        ? { updatedReplyCounts: state.updatedReplyCounts } : {}),
       collection: collectionReport(),
       stats: { requests: state.requests, attempts: state.attempts, sort: state.sortConfirmed ? state.sortApplied : '', errors: [...state.errors] },
       comments: Array.from(state.comments.values()),
@@ -1102,14 +1290,33 @@
     syncCollectionSource();
     if (message.key !== collectionSource || !/^(video|post):/.test(collectionSource)) throw new Error('YouTube source changed.');
     if (message.action === 'stop') return stopCollection();
+    if (message.action === 'check-count') return checkReportedCount();
     if (message.action === 'collect') {
-      if (message.fresh === true && !activeCollection) {
+      const incremental = message.refresh === true && Array.isArray(message.knownIds) && message.knownIds.length > 0;
+      if ((message.fresh === true || incremental) && !activeCollection) {
         Object.assign(state, createCollectionState());
+        if (incremental) {
+          state.incremental = true;
+          state.knownTopIds = new Set(message.knownIds.filter((id) => typeof id === 'string').slice(0, 50000));
+          const allIds = Array.isArray(message.knownAllIds) ? message.knownAllIds : message.knownIds;
+          state.knownAllIds = new Set(allIds.filter((id) => typeof id === 'string').slice(0, 50000));
+          state.knownReplyCounts = new Map();
+          if (message.knownReplyCounts && typeof message.knownReplyCounts === 'object') {
+            for (const [id, count] of Object.entries(message.knownReplyCounts)) {
+              const n = Math.floor(Number(count));
+              if (Number.isFinite(n) && n > 0) state.knownReplyCounts.set(id, n);
+            }
+          }
+          const baseline = Math.floor(Number(message.baselineCount));
+          state.baselineCount = Number.isFinite(baseline) && baseline > 0 ? baseline : state.knownAllIds.size;
+          state.updatedReplyCounts = Object.create(null);
+        }
         resetMetadata();
       }
       const result = await run(message.background === true);
       if (message.key !== sourceKey()) throw new Error('YouTube source changed.');
-      return { result, snapshot: state.comments.size && result?.status !== 'stopped' ? exportData() : null };
+      const hasExport = (state.comments.size > 0 || state.incremental) && result?.status !== 'stopped';
+      return { result, incremental: state.incremental, snapshot: hasExport ? exportData() : null };
     }
     if (message.action === 'transcript') {
       transcriptController?.abort();

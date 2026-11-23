@@ -79,7 +79,7 @@ function ensureBridge() {
   const connected = Promise.withResolvers();
   ready = connected.resolve;
   opening = (async () => {
-    const timer = setTimeout(() => connected.reject(new Error('Chrome could not connect to Ollama on port 11434.')), 8000);
+    const timer = setTimeout(() => connected.reject(new Error('The browser could not connect to Ollama on port 11434.')), 8000);
     // The document can outlive a suspended worker. Wake its existing iframe in that case.
     const setup = (async () => {
       if (!await hasOllamaAccess()) {
