@@ -444,8 +444,20 @@ globalThis.YTCT = (() => {
     return { key, duration, comments, authors };
   }
 
+  function exportTimestamp(entry) {
+    if (!entry) return null;
+    let raw = entry.snapshot?.exportedAt || entry.snapshot?.metadata?.collectedAt || entry.snapshot?.startedAt || '';
+    if (!raw && typeof entry.markdown === 'string') {
+      const header = entry.markdown.replace(/^\uFEFF/, '').split(/\r?\n## @/, 1)[0];
+      raw = /^- Exported:\s*(\S+)/m.exec(header)?.[1] || '';
+    }
+    if (!raw) return null;
+    const date = new Date(raw);
+    return Number.isFinite(date.getTime()) ? date : null;
+  }
+
   return Object.freeze({ settingsDefaults, sourceKey, isMediaSource, sourceLink, formatDuration, parseLikes,
-    buildMarkdown, buildJson, sanitizeName, stamp, markdownSourceKey, parseTimestampToSeconds, TIMESTAMP_PATTERN,
+    buildMarkdown, buildJson, sanitizeName, stamp, markdownSourceKey, exportTimestamp, parseTimestampToSeconds, TIMESTAMP_PATTERN,
     commentTimestamps, sidebarPreview, timelineFor, activeTimestamp, commentsFromExport, commentRows,
     buildAiContext, citationLinks, outputTokenBudget, estimatedTokens, maxEntryBytes });
 })();

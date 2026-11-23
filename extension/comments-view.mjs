@@ -161,7 +161,7 @@ export class CommentsView {
 
   reset(key) {
     this.clearHighlight();
-    Object.assign(this, { key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [],
+    Object.assign(this, { key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [], syncTimeline: [],
       query: '', media: null, active: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE, entry: null,
       scrollGuard: 0, expectedScrollTop: null });
     this.expanded = new Map();
@@ -301,6 +301,14 @@ export class CommentsView {
       });
     }
 
+    const syncRecords = [];
+    for (const item of this.visible) {
+      // For timestamp stacks, only track the front comment; ignore comments stacked behind it.
+      const thread = item.kind === 'stack' ? item.threads[0] : item.thread;
+      syncRecords.push(thread.root, ...thread.replies);
+    }
+    this.syncTimeline = timelineFor(syncRecords);
+
     const count = (!query && !timestamped) ? this.records.length : this.records.filter(matches).length;
     this.count.textContent = this.entry ? count.toLocaleString() : '';
     this.first = 0;
@@ -348,8 +356,8 @@ export class CommentsView {
     if (index < 0) return false;
     const item = this.visible[index];
     let needsRender = false;
-    if (item.kind === 'stack' && item.threads[0].root.id !== root && !this.expandedStacks.has(item.key)) {
-      // Reveal a comment hidden inside a timestamp stack.
+    if (citation && item.kind === 'stack' && item.threads[0].root.id !== root && !this.expandedStacks.has(item.key)) {
+      // Reveal a cited comment hidden inside a timestamp stack.
       this.expandedStacks.add(item.key);
       needsRender = true;
     }
@@ -370,7 +378,7 @@ export class CommentsView {
   tick(media, force = false) {
     this.media = media;
     if (!this.following) return;
-    const group = media ? activeTimestamp(this.timeline, media.currentTime, this.settings.highlightOffset) : null;
+    const group = media ? activeTimestamp(this.syncTimeline, media.currentTime, this.settings.highlightOffset) : null;
     if (!force && group === this.group) return;
     this.group = group;
     const changed = group !== this.active;

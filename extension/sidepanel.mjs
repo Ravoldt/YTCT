@@ -214,6 +214,26 @@ function resetView(info) {
   else viewer.showEmpty('Preparing the comments…');
 }
 
+function formatCollectedTime(entry) {
+  const date = YTCT.exportTimestamp(entry);
+  if (!date) return null;
+  const now = new Date();
+  const sameDay = date.getFullYear() === now.getFullYear()
+    && date.getMonth() === now.getMonth()
+    && date.getDate() === now.getDate();
+  const sameYear = date.getFullYear() === now.getFullYear();
+  const formatted = sameDay
+    ? date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : date.toLocaleString([], {
+      ...(sameYear ? {} : { year: 'numeric' }),
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+    });
+  return { text: 'Collected ' + formatted, full: date.toLocaleString() };
+}
+
 function updatePageHeader() {
   byId('source-title').textContent = state?.title || 'Open a YouTube video or post';
   byId('video-tools').hidden = !state?.key.startsWith('video:');
@@ -223,14 +243,25 @@ function updatePageHeader() {
   const partial = state?.entry?.snapshot?.collection?.status === 'partial';
   const limitReached = !!state?.entry?.snapshot?.collection?.limitReached;
   byId('collection').hidden = !state;
-  byId('download-export').hidden = !state?.entry;
-  byId('collect').hidden = !!state?.entry && !progress.running && (!partial || limitReached);
-  byId('collect').textContent = progress.running ? 'Stop' : partial ? 'Resume' : 'Collect';
-  byId('collection-status').textContent = progress.running
-    ? 'Collecting' + (progress.count ? ' · ' + progress.count.toLocaleString() : '') + '…'
-    : progress.status === 'stopped' ? 'Collection stopped'
-      : limitReached ? 'Partial export · size limit reached'
-        : partial ? 'Partial export' : state?.entry ? 'Comments ready' : progress.reason || 'Comments haven’t been collected';
+  const collectButton = byId('collect');
+  collectButton.textContent = progress.running ? 'Stop' : 'Collect';
+  collectButton.title = progress.running ? 'Stop collecting comments'
+    : state?.entry ? 'Collect comments again' : 'Collect comments';
+  const statusEl = byId('collection-status');
+  if (progress.running) {
+    statusEl.textContent = 'Collecting' + (progress.count ? ' · ' + progress.count.toLocaleString() : '') + '…';
+    statusEl.removeAttribute('title');
+  } else if (state?.entry) {
+    const collected = formatCollectedTime(state.entry);
+    const base = collected ? collected.text : 'Imported comments';
+    const suffix = limitReached ? ' · size limit reached' : partial ? ' · partial' : '';
+    statusEl.textContent = base + suffix;
+    if (collected) statusEl.title = 'Collected ' + collected.full;
+    else statusEl.removeAttribute('title');
+  } else {
+    statusEl.textContent = progress.status === 'error' && progress.reason ? progress.reason : 'Not collected yet';
+    statusEl.removeAttribute('title');
+  }
 }
 
 function adoptEntry(entry) {
@@ -686,7 +717,10 @@ async function collect(fresh = false) {
   if (!current) return;
   try {
     if (current.progress?.running) return await tab('stop');
-    await tab('collect', { fresh });
+    const partial = current.entry?.snapshot?.collection?.status === 'partial';
+    const limitReached = !!current.entry?.snapshot?.collection?.limitReached;
+    const startFresh = fresh || (!!current.entry && (!partial || limitReached));
+    await tab('collect', { fresh: startFresh });
   } catch (error) { if (current === state) notice(error.message); }
 }
 
@@ -696,20 +730,6 @@ async function receiveEntry(current, raw) {
   adoptEntry(entry);
   const { reason } = await worker('write-cache', { key: current.key, pageId: current.pageId, entry });
   if (reason && state === current) notice(reason);
-}
-
-async function downloadExport() {
-  const current = state;
-  if (!current?.entry) return;
-  const button = byId('download-export');
-  button.disabled = true;
-  try {
-    await worker('download-export', { key: current.key, pageId: current.pageId, entry: current.entry });
-  } catch (error) {
-    if (state === current) notice(error.message);
-  } finally {
-    button.disabled = false;
-  }
 }
 
 async function loadSavedExport() {
@@ -1376,7 +1396,6 @@ window.addEventListener('resize', () => setAskHeight(askHeight));
 byId('search-mode').addEventListener('click', () => setMode('search'));
 byId('ai-mode').addEventListener('click', () => setMode('ai'));
 byId('collect').addEventListener('click', () => collect());
-byId('download-export').addEventListener('click', downloadExport);
 byId('clear-chat').addEventListener('click', () => { approvedScopes.clear(); clearChat(); });
 byId('load-saved-export').addEventListener('click', loadSavedExport);
 byId('clear-cache').addEventListener('click', clearSavedExports);

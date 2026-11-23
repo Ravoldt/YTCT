@@ -550,10 +550,16 @@
 
   // ------------------------------------------------------------------ image viewer
   // Community post images have no close-up view on YouTube. A full-screen button opens a
-  // borderless overlay: click for 1:1, then drag or scroll to pan.
+  // borderless overlay: scroll wheel or click to zoom, drag to pan, Esc to close.
   const decoratedImages = new WeakSet();
-  const imageCdnHosts = new Set(['yt3.ggpht.com', 'yt3.googleusercontent.com', 'lh3.googleusercontent.com', 'i.ytimg.com']);
   let imageViewer = null;
+
+  function isGoogleImageHost(hostname) {
+    return /^yt\d+\.ggpht\.com$/.test(hostname)
+      || /^lh\d+\.googleusercontent\.com$/.test(hostname)
+      || hostname === 'yt3.googleusercontent.com'
+      || hostname === 'i.ytimg.com';
+  }
 
   function safeImageUrl(raw) {
     try {
@@ -570,7 +576,7 @@
     if (!safe) return '';
     try {
       const url = new URL(safe);
-      if (!imageCdnHosts.has(url.hostname)) return safe;
+      if (!isGoogleImageHost(url.hostname)) return safe;
       // Google's image CDN keeps its resize/crop directive at the end of the path.
       const match = /=(?:w\d+-h\d+|s\d+)[^/]*$/.exec(url.pathname);
       if (match) url.pathname = url.pathname.slice(0, match.index) + '=s0';
@@ -623,6 +629,21 @@
       return { width: root.clientWidth, height: root.clientHeight };
     }
 
+    function fitScale(box = stage()) {
+      if (!state.width || !state.height || !box.width || !box.height) return 1;
+      return Math.min(box.width / state.width, box.height / state.height) || 1;
+    }
+
+    function canPan(box = stage()) {
+      return state.width * state.scale > box.width + 0.5 || state.height * state.scale > box.height + 0.5;
+    }
+
+    function updateCursor() {
+      if (state.drag && canPan()) root.style.cursor = 'grabbing';
+      else if (canPan()) root.style.cursor = 'grab';
+      else root.style.cursor = 'zoom-in';
+    }
+
     function applyTransform() {
       image.style.transform = 'translate(' + state.x + 'px,' + state.y + 'px) scale(' + state.scale + ')';
     }
@@ -637,11 +658,29 @@
 
     function fitView() {
       const box = stage();
-      state.fit = Math.min(box.width / state.width, box.height / state.height, 1) || 1;
+      state.fit = fitScale(box);
       state.scale = state.fit;
       state.x = (box.width - state.width * state.fit) / 2;
       state.y = (box.height - state.height * state.fit) / 2;
-      root.style.cursor = 'zoom-in';
+      updateCursor();
+      applyTransform();
+    }
+
+    function zoomAt(nextScale, clientX, clientY) {
+      if (!state.width) return;
+      const box = stage();
+      const cx = clientX ?? box.width / 2;
+      const cy = clientY ?? box.height / 2;
+      const min = state.fit;
+      const max = Math.max(state.fit * 8, 8);
+      const clamped = Math.min(max, Math.max(min, nextScale));
+      if (Math.abs(clamped - state.scale) < 0.0001) return;
+      const ratio = clamped / state.scale;
+      state.x = cx - (cx - state.x) * ratio;
+      state.y = cy - (cy - state.y) * ratio;
+      state.scale = clamped;
+      clampPan();
+      updateCursor();
       applyTransform();
     }
 
@@ -651,16 +690,7 @@
         fitView();
         return;
       }
-      const box = stage();
-      const x = clientX ?? box.width / 2;
-      const y = clientY ?? box.height / 2;
-      // Keep the clicked image point under the cursor while scaling to 1:1.
-      state.x = x - (x - state.x) / state.scale;
-      state.y = y - (y - state.y) / state.scale;
-      state.scale = 1;
-      clampPan();
-      root.style.cursor = 'grab';
-      applyTransform();
+      zoomAt(Math.max(1, state.fit * 2), clientX, clientY);
     }
 
     function closeViewer() {
@@ -674,10 +704,23 @@
     }
 
     function onKey(event) {
-      if (event.key !== 'Escape') return;
-      event.preventDefault();
-      event.stopPropagation();
-      closeViewer();
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        closeViewer();
+      } else if (event.key === '+' || event.key === '=') {
+        event.preventDefault();
+        event.stopPropagation();
+        zoomAt(state.scale * 1.25);
+      } else if (event.key === '-') {
+        event.preventDefault();
+        event.stopPropagation();
+        zoomAt(state.scale / 1.25);
+      } else if (event.key === '0') {
+        event.preventDefault();
+        event.stopPropagation();
+        fitView();
+      }
     }
 
     function open(url, fallback) {
@@ -727,7 +770,7 @@
       if (event.button !== 0 || event.target === close || close.contains(event.target)) return;
       state.drag = { id: event.pointerId, x: event.clientX, y: event.clientY, left: state.x, top: state.y, moved: false };
       try { root.setPointerCapture(event.pointerId); } catch {}
-      root.style.cursor = 'grabbing';
+      updateCursor();
     });
     root.addEventListener('pointermove', (event) => {
       const drag = state.drag;
@@ -735,7 +778,7 @@
       const dx = event.clientX - drag.x;
       const dy = event.clientY - drag.y;
       if (!drag.moved && Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
-      if (!drag.moved) return;
+      if (!drag.moved || !canPan()) return;
       state.x = drag.left + dx;
       state.y = drag.top + dy;
       clampPan();
@@ -746,7 +789,7 @@
       if (!drag || (event && event.pointerId !== drag.id)) return;
       state.drag = null;
       try { root.releasePointerCapture(drag.id); } catch {}
-      root.style.cursor = zoomed() ? 'grab' : 'zoom-in';
+      updateCursor();
       if (event && event.type === 'pointerup' && !drag.moved) toggleZoom(event.clientX, event.clientY);
     }
     root.addEventListener('pointerup', endDrag);
@@ -754,17 +797,25 @@
     root.addEventListener('wheel', (event) => {
       event.preventDefault();
       event.stopPropagation();
-      if (!state.open) return;
-      const step = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? root.clientHeight : 1;
-      state.x -= (event.shiftKey ? event.deltaY : event.deltaX) * step;
-      state.y -= (event.shiftKey ? 0 : event.deltaY) * step;
-      clampPan();
-      applyTransform();
+      if (!state.open || !state.width) return;
+      const scale = event.deltaMode === 1 ? 32 : event.deltaMode === 2 ? 240 : 1;
+      const dy = Math.max(-240, Math.min(240, event.deltaY * scale));
+      if (!dy) return;
+      zoomAt(state.scale * Math.exp(-dy * 0.0022), event.clientX, event.clientY);
     }, { passive: false });
     window.addEventListener('resize', () => {
       if (!state.open || !state.width) return;
-      if (zoomed()) { clampPan(); applyTransform(); }
-      else fitView();
+      const wasZoomed = zoomed();
+      const box = stage();
+      state.fit = fitScale(box);
+      if (wasZoomed) {
+        state.scale = Math.max(state.fit, state.scale);
+        clampPan();
+        updateCursor();
+        applyTransform();
+      } else {
+        fitView();
+      }
     });
 
     return { open, close: closeViewer };

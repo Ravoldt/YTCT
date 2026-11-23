@@ -143,7 +143,8 @@ async function setVisit(tabId, key, pageId = '') {
   await chrome.storage.session.set({ visits });
   if (prior && (prior.pageId !== pageId || prior.key !== key)) await chrome.storage.session.remove('chat:' + tabId);
   await persistCache(index, removed);
-  return { autoCollect: settings.autoCollect === true && isMediaSource(key) };
+  const hasSaved = settings.cacheEnabled === true && isMediaSource(key) && !!index[key];
+  return { autoCollect: settings.autoCollect === true && isMediaSource(key) && !hasSaved };
 }
 
 async function cacheAction(message, tabId) {
@@ -170,13 +171,13 @@ async function cacheAction(message, tabId) {
   }
   if (message.type === 'read-cache') {
     if (common.removed.length) await persistCache(index, common.removed);
-    if (!index[key] || (!message.explicit && (!settings.cacheEnabled || index[key].pageId !== message.pageId))) return null;
+    if (!index[key] || (!message.explicit && !settings.cacheEnabled)) return null;
     const entry = (await chrome.storage.local.get(entryKey(key)))[entryKey(key)];
     return entry ? normalizeEntry(key, entry) : null;
   }
   if (message.type === 'mark-used') {
     visits[tabId].used = true;
-    if (index[key]?.pageId === message.pageId || message.explicit && index[key]) index[key].used = true;
+    if (index[key] && (settings.cacheEnabled || index[key].pageId === message.pageId || message.explicit)) index[key].used = true;
     await chrome.storage.session.set({ visits });
     await persistCache(index, common.removed);
     return;
@@ -280,6 +281,7 @@ async function handle(message, sender) {
       return cacheTask(() => cacheAction(message, tabId));
     case 'download-cache':
     case 'download-export': {
+      if (!contentTab) throw new Error('Use the download button on YouTube to save a file.');
       const { entry, format } = await cacheTask(async () => {
         const { key, pageId } = message;
         const { visits, settings } = await cacheState();
