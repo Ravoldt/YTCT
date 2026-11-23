@@ -114,6 +114,10 @@ export class CommentsView {
     this.list.addEventListener('touchmove', stop, { passive: true });
     this.list.addEventListener('scroll', () => {
       if (performance.now() < (this.scrollGuard || 0)) return;
+      if (this.expectedScrollTop !== null && Math.abs(this.list.scrollTop - this.expectedScrollTop) <= 2) {
+        this.expectedScrollTop = null;
+        return;
+      }
       stop();
     }, { passive: true });
     this.list.addEventListener('keydown', (event) => {
@@ -128,13 +132,38 @@ export class CommentsView {
   }
 
   holdScroll() {
-    this.scrollGuard = performance.now() + 300;
+    this.scrollGuard = performance.now() + 500;
+  }
+
+  scrollTo(element) {
+    if (!element) return;
+    const target = element.closest?.('.thread.stack-collapsed') || element;
+    const listRect = this.list.getBoundingClientRect();
+    const itemRect = target.getBoundingClientRect();
+    const margin = 8;
+    let next = this.list.scrollTop;
+    if (itemRect.top < listRect.top + margin) {
+      next += itemRect.top - listRect.top - margin;
+    } else if (itemRect.bottom > listRect.bottom - margin) {
+      next += itemRect.height > listRect.height - margin * 2
+        ? itemRect.top - listRect.top - margin
+        : itemRect.bottom - listRect.bottom + margin;
+    } else {
+      return;
+    }
+    const max = Math.max(0, this.list.scrollHeight - this.list.clientHeight);
+    const clamped = Math.max(0, Math.min(max, next));
+    if (Math.abs(clamped - this.list.scrollTop) < 1) return;
+    this.holdScroll();
+    this.list.scrollTop = clamped;
+    this.expectedScrollTop = this.list.scrollTop;
   }
 
   reset(key) {
     this.clearHighlight();
     Object.assign(this, { key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [],
-      query: '', media: null, active: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE, entry: null, scrollGuard: 0 });
+      query: '', media: null, active: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE, entry: null,
+      scrollGuard: 0, expectedScrollTop: null });
     this.expanded = new Map();
     this.expandedStacks = new Set();
     this.full = new Set();
@@ -280,8 +309,24 @@ export class CommentsView {
     this.expandedStacks = new Set();
     this.holdScroll();
     this.list.scrollTop = 0;
+    this.expectedScrollTop = this.list.scrollTop;
     this.render(false);
     if (this.following) this.tick(this.media, true);
+  }
+
+  pickTarget(group) {
+    if (!group) return null;
+    const threadsOf = (item) => (item.kind === 'stack' ? item.threads : [item.thread]);
+    let fallback = null;
+    for (const id of group.keys()) {
+      const root = this.owners.get(id);
+      const item = this.visible.find((entry) => threadsOf(entry).some((thread) => thread.root.id === root));
+      if (!item) continue;
+      const topId = item.kind === 'stack' ? item.threads[0].root.id : item.thread.root.id;
+      if (id === topId) return id;
+      fallback ||= id;
+    }
+    return fallback;
   }
 
   jump(id, citation = true) {
@@ -318,7 +363,7 @@ export class CommentsView {
       this.render();
     }
     this.updateMarks();
-    this.nodes.get(id)?.element.scrollIntoView({ block: 'nearest' });
+    this.scrollTo(this.nodes.get(id)?.element);
     return true;
   }
 
@@ -332,9 +377,9 @@ export class CommentsView {
     clearTimeout(this.highlightTimer);
     this.highlightTimer = null;
     this.active = group;
-    if (group && changed) {
-      const first = group.keys().next().value;
-      if (first) this.jump(first, false);
+    if (group && (changed || force)) {
+      const target = this.pickTarget(group);
+      if (target) this.jump(target, false);
     }
     this.updateMarks();
     this.startHighlightTimer(group);
@@ -374,6 +419,7 @@ export class CommentsView {
       this.render(false);
       this.holdScroll();
       this.list.scrollTop = 0;
+      this.expectedScrollTop = this.list.scrollTop;
     }));
     for (const item of this.visible.slice(this.first, this.last)) {
       fragment.append(item.kind === 'stack' ? this.renderStack(item) : this.renderThread(item.thread));
@@ -382,11 +428,10 @@ export class CommentsView {
       this.last += PAGE_SIZE;
       this.render();
     }));
+    this.holdScroll();
     this.list.replaceChildren(fragment);
-    if (preserve) {
-      this.holdScroll();
-      this.list.scrollTop = top;
-    }
+    if (preserve) this.list.scrollTop = top;
+    this.expectedScrollTop = this.list.scrollTop;
     this.updateMarks();
   }
 
@@ -401,6 +446,7 @@ export class CommentsView {
     if (!delta) return;
     this.holdScroll();
     this.list.scrollTop += delta;
+    this.expectedScrollTop = this.list.scrollTop;
   }
 
   renderStack(item) {

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "YouTube Comment Toolkit",
-  "version": "4.3.1",
+  "version": "4.3.2",
   "description": "Read, search, export, and ask local or cloud LLMs about YouTube comments in the Chrome side panel.",
   "minimum_chrome_version": "142",
   "incognito": "not_allowed",
