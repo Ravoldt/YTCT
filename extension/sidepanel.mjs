@@ -101,7 +101,7 @@ function applyAssistantName() {
   byId('ai-resize').setAttribute('aria-label', 'Resize ' + label);
   byId('ai-mode').setAttribute('aria-label', label);
   byId('ai-mode').title = label;
-  const placeholder = 'Ask ' + name + ' about these comments';
+  const placeholder = 'Ask ' + name;
   askInput.placeholder = placeholder;
   askInput.setAttribute('aria-label', placeholder);
   if (mode === 'ai' && !job) {
@@ -172,7 +172,7 @@ function clearChat() {
   historyHasTranscript = false;
   chat.replaceChildren();
   byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
-  chrome.storage.session.remove('chat:' + tabId).catch(() => {});
+  chrome.storage.session.remove('chat:' + tabId).catch(() => { });
   updateComposer();
 }
 
@@ -453,7 +453,7 @@ function accept(message) {
   if (message.event === 'panel-close') {
     // The side panel can close itself. The background fallback handles a browser that ignores it.
     window.close();
-    setTimeout(() => { worker('close-panel').catch(() => {}); }, 300);
+    setTimeout(() => { worker('close-panel').catch(() => { }); }, 300);
     return;
   }
   if (!state || message.key !== state.key) return;
@@ -622,7 +622,7 @@ async function boundedImageBlob(response, maxBytes = 5 * 1024 * 1024) {
   const chunks = [];
   let total = 0;
   try {
-    for (;;) {
+    for (; ;) {
       const { value, done } = await reader.read();
       if (done) break;
       total += value.byteLength;
@@ -630,7 +630,7 @@ async function boundedImageBlob(response, maxBytes = 5 * 1024 * 1024) {
       chunks.push(value);
     }
   } finally {
-    await reader.cancel().catch(() => {});
+    await reader.cancel().catch(() => { });
     reader.releaseLock();
   }
   const blob = new Blob(chunks, { type });
@@ -781,14 +781,16 @@ async function ask(question) {
     latest = response.content;
     display();
     const citations = [...links.comments].filter(([ref]) => latest.includes(ref));
-    history.push({ role: 'user', content: question }, { role: 'assistant', content: latest,
+    history.push({ role: 'user', content: question }, {
+      role: 'assistant', content: latest,
       duration: links.duration, comments: citations.slice(0, 300),
-      authors: [...links.authors].filter(([author]) => latest.toLowerCase().includes('@' + author)).slice(0, 300) });
+      authors: [...links.authors].filter(([author]) => latest.toLowerCase().includes('@' + author)).slice(0, 300)
+    });
     history = history.slice(-40);
     success = true;
     await chrome.storage.session.set({
       ['chat:' + tabId]: { pageId: current.pageId, key: current.key, destination, shareTranscript: includeTranscript, history },
-    }).catch(() => {});
+    }).catch(() => { });
     if (!isCurrent()) return;
     const scope = [];
     if (response.context.truncated) scope.push(response.context.included.toLocaleString() + ' of ' + response.context.total.toLocaleString() + ' source rows sent');
@@ -898,7 +900,7 @@ async function mergeDeltaEntry(current, delta) {
     current.entry = normalized;
     updatePageHeader();
     startCountPolling(current, false);
-    worker('write-cache', { key: current.key, pageId: current.pageId, entry: normalized }).catch(() => {});
+    worker('write-cache', { key: current.key, pageId: current.pageId, entry: normalized }).catch(() => { });
     notice('No new comments found.');
   }
 }
@@ -1744,7 +1746,7 @@ function setAskHeight(height, persist = false) {
   askHandle.setAttribute('aria-valuenow', String(askHeight));
   askHandle.setAttribute('aria-valuemax', String(Math.round(askMax())));
   if (persist) {
-    try { localStorage.setItem('ytct-ask-height', String(askHeight)); } catch {}
+    try { localStorage.setItem('ytct-ask-height', String(askHeight)); } catch { }
   }
   return askHeight;
 }
@@ -1752,13 +1754,13 @@ function setAskHeight(height, persist = false) {
 try {
   const stored = Number(localStorage.getItem('ytct-ask-height'));
   if (Number.isFinite(stored) && stored > 0) askHeight = stored;
-} catch {}
+} catch { }
 setAskHeight(askHeight);
 
 askHandle.addEventListener('pointerdown', (event) => {
   if (event.button !== 0) return;
   askDrag = { id: event.pointerId, y: event.clientY, height: askSection.getBoundingClientRect().height || askHeight };
-  try { askHandle.setPointerCapture(event.pointerId); } catch {}
+  try { askHandle.setPointerCapture(event.pointerId); } catch { }
   event.preventDefault();
 });
 askHandle.addEventListener('pointermove', (event) => {
@@ -1768,7 +1770,7 @@ askHandle.addEventListener('pointermove', (event) => {
 function endAskDrag(event) {
   if (!askDrag || (event && event.pointerId !== askDrag.id)) return;
   askDrag = null;
-  try { askHandle.releasePointerCapture(event.pointerId); } catch {}
+  try { askHandle.releasePointerCapture(event.pointerId); } catch { }
   setAskHeight(askHeight, true);
 }
 askHandle.addEventListener('pointerup', endAskDrag);
@@ -1878,7 +1880,7 @@ byId('llm-endpoint').addEventListener('input', () => {
   const saved = llm.profiles.find((row) => row.id === llmEditingId);
   const endpoint = byId('llm-endpoint').value.trim();
   let changed = true;
-  try { changed = canonicalEndpoint(endpoint) !== canonicalEndpoint(saved?.endpoint); } catch {}
+  try { changed = canonicalEndpoint(endpoint) !== canonicalEndpoint(saved?.endpoint); } catch { }
   if (saved?.hasKey && !llmProviderChanged) {
     const keep = !changed && !llmKeyClear;
     byId('llm-reveal').disabled = !keep;
