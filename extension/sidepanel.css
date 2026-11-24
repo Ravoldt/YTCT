@@ -139,11 +139,11 @@ footer { display: flex; flex-direction: column; align-items: flex-start; gap: 7p
 .modes svg { width: 16px; height: 16px; }
 .modes button[aria-pressed="true"] { color: var(--ink); background: var(--page); }
 #composer { display: flex; align-items: flex-end; gap: 7px; width: 100%; }
-#query { flex: 1; min-width: 0; background: transparent; border: 1px solid var(--rule); border-radius: 19px; padding: 7px 11px; }
+#query { flex: 1; min-width: 0; font-size: calc(14px * var(--ui-scale)); line-height: 1.45; background: transparent; border: 1px solid var(--rule); border-radius: 19px; padding: 7px 11px; }
 #query::placeholder, #ask-input::placeholder { color: var(--muted); opacity: 1; }
 .ask-field { position: relative; flex: 1; min-width: 0; display: flex; }
 #ask-input { width: 100%; min-width: 0; resize: none; font-size: calc(14px * var(--ui-scale)); line-height: 1.45; background: transparent; border: 1px solid var(--rule); border-radius: 14px; padding: 7px 32px 7px 11px; overflow-y: hidden; scrollbar-width: thin; scrollbar-color: var(--muted) transparent; }
-.ask-expand { position: absolute; top: 4px; right: 4px; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
+.ask-expand { position: absolute; top: 6px; right: 6px; width: 24px; height: 24px; display: grid; place-items: center; padding: 0; border: 0; border-radius: 6px; background: transparent; color: var(--muted); }
 .ask-expand:hover { background: var(--hover); color: var(--ink); }
 .ask-expand svg { width: 15px; height: 15px; }
 footer.ask-expanded { position: fixed; inset: 0; z-index: 40; background: var(--page); border-top: 0; padding: 12px; }
