@@ -44,7 +44,80 @@
       <button id="collect" class="pill" type="button">Collect</button>
     </div>
   </div>
+  <div id="search-meta" class="search-meta" hidden>
+    <div id="search-meta-left" class="search-meta-left"></div>
+    <div id="sort-group" class="sort-group" role="group" aria-label="Sort results" hidden>
+      <button type="button" data-sort="relevance" aria-pressed="true">Relevance</button>
+      <button type="button" data-sort="likes" aria-pressed="false">Likes</button>
+    </div>
+  </div>
+  <div id="embed-progress" class="embed-progress" hidden>
+    <div class="embed-progress-row">
+      <span id="embed-progress-label">Preparing semantic search…</span>
+      <div class="embed-progress-right">
+        <span id="embed-progress-pct">0%</span>
+        <button type="button" id="cancel-embed" class="link-btn embed-cancel-btn">Cancel</button>
+      </div>
+    </div>
+    <div class="progress-track"><div id="embed-progress-fill" class="progress-fill"></div></div>
+  </div>
+  <div id="search-diagnostic" class="search-diagnostic" role="status" hidden></div>
   <main id="comments" aria-label="Comments and replies" tabindex="0"></main>
+
+  <section id="filter-drawer" class="filter-drawer" aria-label="Comment filters" hidden>
+    <div class="drawer-head">
+      <strong>Filters</strong>
+      <div class="drawer-head-actions">
+        <button type="button" id="save-preset-btn" class="link-btn">+ Save preset</button>
+        <button type="button" id="clear-filters" class="link-btn">Clear all</button>
+        <button type="button" id="close-filters" class="link-btn">Done</button>
+      </div>
+    </div>
+    <div id="preset-save-row" class="preset-save-row" hidden>
+      <input id="preset-name-input" type="text" maxlength="60" placeholder="Preset name" aria-label="Preset name">
+      <button type="button" id="preset-save-confirm" class="pill primary">Save</button>
+      <button type="button" id="preset-save-cancel" class="pill">Cancel</button>
+    </div>
+    <div id="drawer-presets-section" class="drawer-section" hidden>
+      <span class="drawer-label">Saved presets</span>
+      <div id="drawer-preset-list" class="chip-row"></div>
+    </div>
+    <div class="drawer-section">
+      <div class="chip-row">
+        <button type="button" class="filter-chip" data-filter-toggle="hasLikes" aria-pressed="false">Has likes</button>
+        <button type="button" class="filter-chip" data-filter-toggle="hasReplies" aria-pressed="false">Has replies</button>
+        <button type="button" class="filter-chip" data-filter-toggle="hearted" aria-pressed="false"><span class="heart-dot" aria-hidden="true">♥</span> Creator liked</button>
+        <button type="button" class="filter-chip" data-filter-toggle="byCreator" aria-pressed="false">By creator</button>
+        <button type="button" class="filter-chip" data-filter-toggle="creatorReplied" aria-pressed="false">Creator replied</button>
+        <button type="button" class="filter-chip" data-filter-toggle="mentionsCreator" aria-pressed="false">Mentions creator</button>
+        <button type="button" class="filter-chip" data-filter-toggle="edited" aria-pressed="false">Edited</button>
+      </div>
+    </div>
+    <div class="drawer-section">
+      <div class="filter-grid">
+        <label class="filter-field">
+          <span>Min likes</span>
+          <input id="f-min-likes" type="number" min="0" inputmode="numeric" placeholder="Any">
+        </label>
+        <label class="filter-field">
+          <span>Max likes</span>
+          <input id="f-max-likes" type="number" min="0" inputmode="numeric" placeholder="Any">
+        </label>
+        <label class="filter-field">
+          <span>Min replies</span>
+          <input id="f-min-replies" type="number" min="0" inputmode="numeric" placeholder="Any">
+        </label>
+        <label class="filter-field">
+          <span>Max replies</span>
+          <input id="f-max-replies" type="number" min="0" inputmode="numeric" placeholder="Any">
+        </label>
+        <label class="filter-field filter-field-wide">
+          <span>Author</span>
+          <input id="f-author" type="text" maxlength="120" autocomplete="off" spellcheck="false" placeholder="@handle">
+        </label>
+      </div>
+    </div>
+  </section>
 
   <section id="ai" class="ask" aria-label="Ask LLM" hidden>
     <div id="ai-resize" class="ask-resize" role="separator" aria-orientation="horizontal" aria-label="Resize Ask LLM"
@@ -65,24 +138,40 @@
   </section>
 
   <footer>
-    <div class="modes" role="group" aria-label="Input mode">
-      <button id="search-mode" type="button" aria-pressed="true">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <circle cx="10.8" cy="10.8" r="6.6" />
-          <path d="m16 16 4.5 4.5" />
-        </svg>
-        Search
-      </button>
-      <button id="ai-mode" type="button" aria-pressed="false" aria-label="Ask LLM">
-        <svg viewBox="0 0 24 24" aria-hidden="true">
-          <path d="M13 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v4l4-4h6a2 2 0 0 0 2-2v-3M7 8h5m-5 4h8" />
-          <path class="spark" d="m19 2 1.2 3.3L23.5 6.5l-3.3 1.2L19 11l-1.2-3.3L14.5 6.5l3.3-1.2L19 2z" />
-        </svg>
-        <span id="ai-mode-label">Ask LLM</span>
-      </button>
+    <div class="footer-top">
+      <div class="modes" role="group" aria-label="Input mode">
+        <button id="search-mode" type="button" aria-pressed="true">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <circle cx="10.8" cy="10.8" r="6.6" />
+            <path d="m16 16 4.5 4.5" />
+          </svg>
+          Search
+        </button>
+        <button id="ai-mode" type="button" aria-pressed="false" aria-label="Ask LLM">
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M13 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v4l4-4h6a2 2 0 0 0 2-2v-3M7 8h5m-5 4h8" />
+            <path class="spark" d="m19 2 1.2 3.3L23.5 6.5l-3.3 1.2L19 11l-1.2-3.3L14.5 6.5l3.3-1.2L19 2z" />
+          </svg>
+          <span id="ai-mode-label">Ask LLM</span>
+        </button>
+      </div>
+      <div id="search-strength" class="strength-group" role="group" aria-label="Search matching mode">
+        <button type="button" data-search-mode="exact" aria-pressed="false" title="Literal substring match">Exact</button>
+        <button type="button" data-search-mode="fuzzy" aria-pressed="true" title="Typo-tolerant word matching">Fuzzy</button>
+        <button type="button" data-search-mode="semantic" aria-pressed="false" title="Local semantic + hybrid search">Semantic</button>
+      </div>
     </div>
     <form id="composer">
-      <input id="query" type="search" placeholder="Search comments" aria-label="Search comments" autocomplete="off">
+      <div id="search-field" class="search-field">
+        <div id="regex-error-tip" class="regex-error-tip" role="status" hidden></div>
+        <textarea id="query" rows="1" placeholder="Search comments" aria-label="Search comments" autocomplete="off" spellcheck="false"></textarea>
+        <button id="regex-toggle" class="regex-btn" type="button" aria-pressed="false" title="Toggle regular expression search" aria-label="Toggle regular expression search">.*</button>
+      </div>
+      <button id="filter-toggle" class="filter-toggle-btn" type="button" aria-expanded="false" aria-controls="filter-drawer" title="Filter comments">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 6h18M6 12h12M10 18h4" /></svg>
+        <span class="filter-toggle-label">Filters</span>
+        <span id="filter-count" class="filter-count" hidden>0</span>
+      </button>
       <div id="ask-field" class="ask-field" hidden>
         <textarea id="ask-input" rows="1" placeholder="Ask LLM" aria-label="Ask LLM"></textarea>
         <button id="expand-ask" class="ask-expand" type="button" aria-pressed="false"
@@ -103,6 +192,8 @@
         <div class="settings-tabs" role="tablist" aria-label="Settings sections">
           <button id="settings-tab-general" class="settings-tab" type="button" role="tab" aria-selected="true"
             aria-controls="settings-general" tabindex="0">General</button>
+          <button id="settings-tab-search" class="settings-tab" type="button" role="tab" aria-selected="false"
+            aria-controls="settings-search" tabindex="-1">Search</button>
           <button id="settings-tab-llm" class="settings-tab" type="button" role="tab" aria-selected="false"
             aria-controls="settings-llm" tabindex="-1">LLM</button>
         </div>
@@ -163,6 +254,48 @@
         </fieldset>
         <p class="hint"><a href="privacy.html" target="_blank" rel="noopener">Privacy policy</a></p>
         <p id="settings-error" class="settings-error" role="status" hidden></p>
+        <button type="submit" class="pill primary save-settings">Save settings</button>
+      </div>
+
+      <div id="settings-search" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-search" hidden>
+        <fieldset>
+          <legend>Text search</legend>
+          <label>Default search mode
+            <select name="defaultSearchMode">
+              <option value="fuzzy">Fuzzy</option>
+              <option value="exact">Exact</option>
+            </select>
+          </label>
+          <p class="hint">Fuzzy mode tolerates small spelling mistakes on words of 4+ characters without noisy subsequence matches.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Semantic search</legend>
+          <label>Enable local semantic search <input name="semanticSearchEnabled" type="checkbox"></label>
+          <p class="hint">Off by default. Enabling downloads a small quantized embedding model from Hugging Face and the ONNX WebAssembly runtime on first use, cached locally in browser storage. Comments stay on your device.</p>
+          <label>Embedding model
+            <select name="semanticModel" class="wide-select">
+              <option value="arctic-xs">Fast English · arctic-embed-xs (~23 MB)</option>
+              <option value="bge-small">Balanced English · bge-small-en (~33 MB)</option>
+              <option value="e5-multi">Multilingual · multilingual-e5-small (~118 MB)</option>
+            </select>
+          </label>
+          <label>Compute device
+            <select name="semanticDevice" class="wide-select">
+              <option value="auto">Auto (WebGPU, fallback CPU)</option>
+              <option value="wasm">CPU only (WASM)</option>
+            </select>
+          </label>
+          <p id="search-cache-usage" class="hint" role="status">Checking embedding cache…</p>
+          <div class="button-row search-cache-actions">
+            <button type="button" id="clear-indexed-comments" class="pill">Clear indexed comments</button>
+            <button type="button" id="clear-downloaded-models" class="pill">Clear downloaded models</button>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>Saved filter presets</legend>
+          <div id="settings-presets-list"></div>
+          <p class="hint">Presets are never auto-loaded. Apply them manually from the Filters drawer.</p>
+        </fieldset>
         <button type="submit" class="pill primary save-settings">Save settings</button>
       </div>
     </form>

@@ -94,7 +94,64 @@ function normalizeSettings(raw = {}) {
     stackComments: s.stackComments !== false,
     stackWindow: bounded(s.stackWindow, 3, 0, 60),
     linkTheater: s.linkTheater === true,
+    defaultSearchMode: s.defaultSearchMode === 'exact' ? 'exact' : 'fuzzy',
+    semanticSearchEnabled: s.semanticSearchEnabled === true,
+    semanticModel: ['arctic-xs', 'bge-small', 'e5-multi'].includes(s.semanticModel) ? s.semanticModel : 'arctic-xs',
+    semanticDevice: s.semanticDevice === 'wasm' ? 'wasm' : 'auto',
   };
+}
+
+function normalizeSearchPreset(raw, index = 0) {
+  if (!raw || typeof raw !== 'object') return null;
+  const name = String(raw.name || '').trim().slice(0, 60);
+  if (!name) return null;
+  const id = typeof raw.id === 'string' && /^[A-Za-z0-9_-]{1,64}$/.test(raw.id)
+    ? raw.id : 'preset-' + Date.now() + '-' + index;
+  const f = raw.filters && typeof raw.filters === 'object' ? raw.filters : {};
+  const optNum = (v) => {
+    if (v === '' || v === null || v === undefined) return '';
+    const n = Math.floor(Number(v));
+    return Number.isFinite(n) && n >= 0 ? String(Math.min(1000000000, n)) : '';
+  };
+  return {
+    id,
+    name,
+    query: String(raw.query || '').slice(0, 1000),
+    isRegex: f.isRegex === true || raw.isRegex === true,
+    mode: ['exact', 'fuzzy', 'semantic'].includes(raw.mode) ? raw.mode : 'fuzzy',
+    filters: {
+      hasLikes: f.hasLikes === true,
+      hasReplies: f.hasReplies === true,
+      hearted: f.hearted === true,
+      byCreator: f.byCreator === true,
+      creatorReplied: f.creatorReplied === true,
+      mentionsCreator: f.mentionsCreator === true,
+      edited: f.edited === true,
+      minLikes: optNum(f.minLikes),
+      maxLikes: optNum(f.maxLikes),
+      minReplies: optNum(f.minReplies),
+      maxReplies: optNum(f.maxReplies),
+      author: String(f.author || '').trim().slice(0, 120),
+    },
+  };
+}
+
+async function searchPresetsAction(message) {
+  const stored = (await chrome.storage.local.get('searchPresets')).searchPresets;
+  let presets = Array.isArray(stored) ? stored.map(normalizeSearchPreset).filter(Boolean).slice(0, 50) : [];
+  if (message.action === 'save' && message.preset) {
+    const clean = normalizeSearchPreset(message.preset, presets.length);
+    if (!clean) throw new Error('Enter a preset name.');
+    const idx = presets.findIndex((p) => p.id === clean.id);
+    if (idx >= 0) presets[idx] = clean;
+    else presets.push(clean);
+    presets = presets.slice(-50);
+    await chrome.storage.local.set({ searchPresets: presets });
+  } else if (message.action === 'delete' && typeof message.id === 'string') {
+    presets = presets.filter((p) => p.id !== message.id);
+    await chrome.storage.local.set({ searchPresets: presets });
+  }
+  return presets;
 }
 
 async function cacheState() {
@@ -295,6 +352,9 @@ async function handle(message, sender) {
     case 'settings':
       if (!panelTab) throw new Error('Open the side panel to manage settings.');
       return cacheTask(() => cacheAction(message, tabId));
+    case 'search-presets':
+      if (!panelTab) throw new Error('Open the side panel to manage search presets.');
+      return cacheTask(() => searchPresetsAction(message));
     case 'download-cache':
     case 'download-export': {
       if (!contentTab) throw new Error('Use the download button on YouTube to save a file.');

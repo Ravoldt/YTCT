@@ -1,5 +1,54 @@
+import {
+  computeDatasetStats, countActiveFilters, defaultFilters, diagnoseFilters, fuseSearchResults,
+  fuzzyMatchScore, isCreatorRecord, recordPassesFilters, semanticModelSpec, threadPassesThreadFilters,
+  validateRegex,
+} from './search-engine.mjs';
+
 const { commentTimestamps, parseLikes, timelineFor, activeTimestamps, sidebarPreview, sourceLink, formatDuration } = YTCT;
 const PAGE_SIZE = 45;
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function buildHighlightRegex(query, isRegex) {
+  const q = String(query || '').trim();
+  if (!q) return null;
+  if (isRegex) {
+    const check = validateRegex(q);
+    if (!check.ok || !check.regex) return null;
+    try { return new RegExp(check.regex.source, 'gi'); } catch { return null; }
+  }
+  const words = q.match(/[\p{L}\p{N}_@]+/gu) || q.split(/\s+/).filter(Boolean);
+  const terms = [...new Set(words.filter((w) => w.length >= 2))].slice(0, 12);
+  if (!terms.length) return null;
+  try { return new RegExp('(' + terms.map(escapeRegExp).join('|') + ')', 'gi'); } catch { return null; }
+}
+
+function appendHighlightedChunk(node, chunk, highlightRegex) {
+  if (!chunk) return;
+  if (!highlightRegex) {
+    node.append(chunk);
+    return;
+  }
+  highlightRegex.lastIndex = 0;
+  let last = 0;
+  let marks = 0;
+  let match;
+  while ((match = highlightRegex.exec(chunk)) !== null && marks < 40) {
+    if (match[0].length === 0) {
+      highlightRegex.lastIndex++;
+      continue;
+    }
+    if (match.index > last) node.append(chunk.slice(last, match.index));
+    const mark = document.createElement('mark');
+    mark.textContent = match[0];
+    node.append(mark);
+    last = match.index + match[0].length;
+    marks++;
+  }
+  if (last < chunk.length) node.append(chunk.slice(last));
+}
 
 export function commentThreads(records) {
   const byId = new Map(records.map((record) => [record.id, record]));
@@ -40,18 +89,19 @@ export function timestampAnchor(key, seconds, seek, label) {
   return link;
 }
 
-function appendCommentText(node, text, key, duration, seek) {
+function appendCommentText(node, text, key, duration, seek, highlightRegex = null) {
   if (!key.startsWith('video:')) {
-    node.append(text);
+    appendHighlightedChunk(node, text, highlightRegex);
     return;
   }
   const hits = commentTimestamps(text, duration).sort((a, b) => a.index - b.index);
   let start = 0;
   for (const hit of hits) {
-    node.append(text.slice(start, hit.index), timestampAnchor(key, hit.seconds, seek, hit.label));
+    appendHighlightedChunk(node, text.slice(start, hit.index), highlightRegex);
+    node.append(timestampAnchor(key, hit.seconds, seek, hit.label));
     start = hit.index + hit.label.length;
   }
-  node.append(text.slice(start));
+  appendHighlightedChunk(node, text.slice(start), highlightRegex);
 }
 
 function svg(path) {
@@ -99,8 +149,8 @@ function exceedsClampLines(node) {
 }
 
 export class CommentsView {
-  constructor({ list, count, follow, timestampOnly, playhead = null, seek }) {
-    Object.assign(this, { list, count, follow, timestampOnly, playhead, seek });
+  constructor({ list, count, follow, timestampOnly, playhead = null, seek, onFilterChange = null }) {
+    Object.assign(this, { list, count, follow, timestampOnly, playhead, seek, onFilterChange });
     this.settings = YTCT.settingsDefaults;
     this.lastWidth = 0;
     this.resizeFrame = 0;
@@ -205,9 +255,14 @@ export class CommentsView {
   reset(key) {
     this.activeTimers ||= new Map();
     this.clearHighlight();
-    Object.assign(this, { key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [], syncTimeline: [],
-      query: '', media: null, active: new Map(), lastHighlightedId: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE,
-      entry: null, scrollGuard: 0, expectedScrollTop: null });
+    Object.assign(this, {
+      key, records: [], byId: new Map(), threads: [], owners: new Map(), visible: [], timeline: [], syncTimeline: [],
+      query: '', searchMode: this.settings?.defaultSearchMode === 'exact' ? 'exact' : 'fuzzy', isRegex: false,
+      filters: defaultFilters(), sort: 'likes', sortPinned: false, regexHitIds: null, semanticScores: null,
+      matchInfo: new Map(), datasetStats: null, lastDiagnosis: null, highlightRegex: null, highlightKey: '',
+      media: null, active: new Map(), lastHighlightedId: null, focused: null, jumpReply: null, first: 0, last: PAGE_SIZE,
+      entry: null, scrollGuard: 0, expectedScrollTop: null,
+    });
     this.expanded = new Map();
     this.expandedStacks = new Set();
     this.full = new Set();
@@ -219,6 +274,10 @@ export class CommentsView {
     this.setScale(this.settings.fontScale);
     this.count.textContent = '';
     this.list.replaceChildren();
+    this.onFilterChange?.({
+      total: 0, matchedThreads: 0, matchedRecords: 0, diagnosis: null,
+      effectiveSort: 'likes', hasQuery: false, hasFilters: false, stats: null,
+    });
   }
 
   load(entry) {
@@ -234,17 +293,60 @@ export class CommentsView {
     this.owners = owners;
     this.threads = threads;
     this.timeline = timelineFor(this.records);
+    this.datasetStats = computeDatasetStats(
+      this.threads,
+      entry?.snapshot?.metadata || null,
+      !entry?.snapshot && !!entry?.markdown,
+      parseLikes,
+    );
     this.follow.disabled = !this.timeline.length;
     if (!this.timeline.length) this.setFollow(false);
     this.filter();
   }
 
   setQuery(query) {
-    const next = query.trim().toLocaleLowerCase();
+    const next = String(query || '').trim();
     if (this.query === next) return;
     this.query = next;
+    this.sortPinned = false;
+    this.regexHitIds = null;
     if (next) this.setFollow(false);
     this.filter();
+  }
+
+  setSearchState(partial = {}) {
+    if ('query' in partial) this.query = String(partial.query || '').trim();
+    if ('searchMode' in partial) this.searchMode = partial.searchMode;
+    if ('isRegex' in partial) this.isRegex = !!partial.isRegex;
+    if ('filters' in partial) this.filters = { ...defaultFilters(), ...partial.filters };
+    if ('sort' in partial) this.sort = partial.sort === 'relevance' ? 'relevance' : 'likes';
+    if ('sortPinned' in partial) this.sortPinned = !!partial.sortPinned;
+    if ('regexHitIds' in partial) this.regexHitIds = partial.regexHitIds;
+    if ('semanticScores' in partial) this.semanticScores = partial.semanticScores;
+    if (this.query) this.setFollow(false);
+    this.filter();
+  }
+
+  getCandidateRecords() {
+    const timestamped = this.timestampOnly.checked;
+    const out = [];
+    for (const thread of this.threads) {
+      if (!threadPassesThreadFilters(thread, this.filters, this.datasetStats)) continue;
+      for (const rec of [thread.root, ...thread.replies]) {
+        if (timestamped && !rec.timestamps.length) continue;
+        if (!recordPassesFilters(rec, this.filters, this.datasetStats, parseLikes)) continue;
+        out.push({ id: rec.id, blob: rec.text + '\n@' + rec.author, text: rec.text });
+      }
+    }
+    return out;
+  }
+
+  getAllIndexableRecords() {
+    return this.records.map((rec) => ({ id: rec.id, text: (rec.author ? '@' + rec.author + ': ' : '') + rec.text }));
+  }
+
+  getDatasetStats() {
+    return this.datasetStats;
   }
 
   setSettings(settings) {
@@ -288,23 +390,116 @@ export class CommentsView {
 
   filter() {
     this.clearHighlight();
-    const query = this.query;
+    const q = this.query.trim();
+    const qLow = q.toLocaleLowerCase();
     const timestamped = this.timestampOnly.checked;
-    const matches = (record) => (!timestamped || record.timestamps.length > 0) &&
-      (!query || (record.text + '\n@' + record.author).toLocaleLowerCase().includes(query));
-    const entries = [];
+    const filters = this.filters || defaultFilters();
+    const hasFilters = countActiveFilters(filters) > 0;
+    const stats = this.datasetStats;
+    this.lastDiagnosis = diagnoseFilters(filters, stats);
+    this.matchInfo = new Map();
+    this.highlightRegex = q ? buildHighlightRegex(q, this.isRegex) : null;
+    this.highlightKey = q ? (this.isRegex ? 're:' : 'q:') + q : '';
+
+    // Stage 1: Evaluate structured filters (and timestamped-only) before text search.
+    const survivingThreads = [];
+    const survivingRecords = [];
     for (const thread of this.threads) {
-      const rootMatch = matches(thread.root);
-      // Timestamped-only mode keeps every reply under a matching timestamped root,
-      // even when the replies themselves do not mention a timestamp.
-      let replies;
-      if (query) replies = thread.replies.filter(matches);
-      else if (timestamped) replies = rootMatch ? thread.replies : thread.replies.filter(matches);
-      else replies = thread.replies;
-      if (!rootMatch && !replies.length) continue;
-      const item = { ...thread, replies, matchedReplies: !rootMatch && replies.length > 0 };
+      if (!threadPassesThreadFilters(thread, filters, stats)) continue;
+      const rootPass = (!timestamped || thread.root.timestamps.length > 0)
+        && recordPassesFilters(thread.root, filters, stats, parseLikes);
+      const passedReplies = thread.replies.filter((reply) =>
+        (!timestamped || reply.timestamps.length > 0)
+        && recordPassesFilters(reply, filters, stats, parseLikes));
+      // Timestamped-only mode without filters/query keeps all replies under a timestamped root.
+      const keepAllReplies = !q && !hasFilters && timestamped && rootPass;
+      if (!rootPass && !passedReplies.length) continue;
+      survivingThreads.push({
+        thread,
+        rootPass,
+        replies: keepAllReplies ? thread.replies : (hasFilters || q || timestamped ? passedReplies : thread.replies),
+      });
+      if (rootPass) survivingRecords.push(thread.root);
+      for (const reply of passedReplies) survivingRecords.push(reply);
+    }
+
+    // Stage 2: Text matching on surviving candidates.
+    if (q) {
+      if (this.isRegex) {
+        if (this.regexHitIds instanceof Set) {
+          for (const rec of survivingRecords) {
+            if (this.regexHitIds.has(rec.id)) {
+              this.matchInfo.set(rec.id, { score: 1, matchType: 'regex', semanticPct: 0 });
+            }
+          }
+        } else {
+          const checked = validateRegex(q);
+          if (checked.ok && checked.regex) {
+            for (const rec of survivingRecords) {
+              if (checked.regex.test(rec.text + '\n@' + rec.author)) {
+                this.matchInfo.set(rec.id, { score: 1, matchType: 'regex', semanticPct: 0 });
+              }
+            }
+          }
+        }
+      } else if (this.searchMode === 'exact') {
+        for (const rec of survivingRecords) {
+          if ((rec.text + '\n@' + rec.author).toLocaleLowerCase().includes(qLow)) {
+            this.matchInfo.set(rec.id, { score: 1, matchType: 'exact', semanticPct: 0 });
+          }
+        }
+      } else {
+        const exactIds = [];
+        const fuzzyScores = new Map();
+        const likesById = new Map();
+        for (const rec of survivingRecords) {
+          const blob = rec.text + '\n@' + rec.author;
+          likesById.set(rec.id, parseLikes(rec.likes));
+          if (blob.toLocaleLowerCase().includes(qLow)) exactIds.push(rec.id);
+          const fScore = fuzzyMatchScore(blob, q);
+          if (fScore > 0) fuzzyScores.set(rec.id, fScore);
+        }
+        const semMap = this.searchMode === 'semantic' && this.semanticScores instanceof Map
+          ? new Map(survivingRecords.filter((rec) => this.semanticScores.has(rec.id)).map((rec) => [rec.id, this.semanticScores.get(rec.id)]))
+          : new Map();
+        const minSemanticScore = semanticModelSpec(this.settings?.semanticModel).minScore;
+        this.matchInfo = fuseSearchResults({ exactIds, fuzzyScores, semanticScores: semMap, likesById, minSemanticScore });
+      }
+    }
+
+    // Stage 3: Build visible threads and sort.
+    const entries = [];
+    let matchedRecords = 0;
+    for (const { thread, rootPass, replies: candidateReplies } of survivingThreads) {
+      let rootMatch = rootPass;
+      let replies = candidateReplies;
+      let threadScore = 0;
+      if (q) {
+        rootMatch = rootPass && this.matchInfo.has(thread.root.id);
+        replies = candidateReplies.filter((reply) => this.matchInfo.has(reply.id));
+        if (!rootMatch && !replies.length) continue;
+        if (rootMatch) {
+          matchedRecords++;
+          threadScore = Math.max(threadScore, this.matchInfo.get(thread.root.id)?.score || 0);
+        }
+        for (const reply of replies) {
+          matchedRecords++;
+          threadScore = Math.max(threadScore, this.matchInfo.get(reply.id)?.score || 0);
+        }
+      } else {
+        if (rootMatch) matchedRecords++;
+        matchedRecords += replies.length;
+      }
+      const expandForCreatorReply = !q && filters.creatorReplied && replies.some((r) =>
+        isCreatorRecord(r, stats?.metadata, stats?.creatorHandle));
+      const item = {
+        ...thread,
+        replies,
+        matchedReplies: (!rootMatch && replies.length > 0) || expandForCreatorReply,
+        searchScore: threadScore,
+      };
       if (!timestamped) {
-        entries.push({ kind: 'thread', thread: item });
+        entries.push({ kind: 'thread', thread: item, score: threadScore });
         continue;
       }
       const rootSeconds = thread.root.timestamps[0]?.seconds ?? null;
@@ -315,10 +510,16 @@ export class CommentsView {
         seconds = all.length ? Math.min(...all) : null;
       }
       if (seconds === null) continue;
-      entries.push({ kind: 'thread', thread: item, seconds, stackable: rootSeconds !== null });
+      entries.push({ kind: 'thread', thread: item, seconds, stackable: rootSeconds !== null, score: threadScore });
     }
 
+    const effectiveSort = q && !timestamped && !this.sortPinned ? 'relevance' : (q && !timestamped ? this.sort : 'likes');
     if (!timestamped) {
+      if (effectiveSort === 'relevance' && q) {
+        entries.sort((a, b) => b.score - a.score
+          || likesOf(b.thread) - likesOf(a.thread)
+          || String(a.thread.root.id).localeCompare(String(b.thread.root.id)));
+      }
       this.visible = entries;
     } else {
       entries.sort((a, b) => a.seconds - b.seconds
@@ -361,7 +562,7 @@ export class CommentsView {
     }
     this.syncTimeline = timelineFor(syncRecords);
 
-    const count = (!query && !timestamped) ? this.records.length : this.records.filter(matches).length;
+    const count = (!q && !timestamped && !hasFilters) ? this.records.length : matchedRecords;
     this.count.textContent = this.entry ? count.toLocaleString() : '';
     this.first = 0;
     this.last = PAGE_SIZE;
@@ -372,6 +573,16 @@ export class CommentsView {
     this.expectedScrollTop = this.list.scrollTop;
     this.render(false);
     if (this.following) this.tick(this.media, true);
+    this.onFilterChange?.({
+      total: this.records.length,
+      matchedThreads: this.visible.length,
+      matchedRecords,
+      diagnosis: this.lastDiagnosis,
+      effectiveSort,
+      hasQuery: !!q,
+      hasFilters,
+      stats,
+    });
   }
 
   pickTarget(ids) {
@@ -590,7 +801,8 @@ export class CommentsView {
     const rawBatch = Number(this.settings.replyBatch);
     const loadAll = rawBatch === 0;
     const batch = loadAll ? count : (rawBatch > 0 ? rawBatch : 10);
-    const expansion = this.query || this.timestampOnly.checked ? this.filteredExpanded : this.expanded;
+    const hasActive = !!this.query || countActiveFilters(this.filters) > 0 || this.timestampOnly.checked;
+    const expansion = hasActive ? this.filteredExpanded : this.expanded;
     const expanded = expansion.get(root.id) ?? (matchedReplies ? batch : 0);
     const jumpIndex = this.jumpReply ? replies.findIndex((reply) => reply.id === this.jumpReply) + 1 : 0;
     const visibleCount = Math.min(count, Math.max(expanded, jumpIndex));
@@ -613,7 +825,7 @@ export class CommentsView {
     if (amount) {
       const list = document.createElement('div');
       list.className = 'reply-list';
-      for (const reply of replies.slice(0, amount)) list.append(this.renderRecord(reply).element);
+      for (const reply of replies.slice(0, amount)) list.append(this.renderRecord(reply, { isReply: true }).element);
       if (amount < count) {
         const next = Math.min(batch, count - amount);
         list.append(button('Show ' + next + ' more ' + (next === 1 ? 'reply' : 'replies'), 'text-button', () => {
@@ -626,13 +838,16 @@ export class CommentsView {
     return thread;
   }
 
-  renderRecord(record, { stackRole = null, stackKey = null, stackExpanded = false, stackCount = 0 } = {}) {
+  renderRecord(record, { stackRole = null, stackKey = null, stackExpanded = false, stackCount = 0, isReply = false } = {}) {
     const element = document.createElement('article');
     element.className = 'entry';
     element.dataset.commentId = record.id;
     if (stackRole) element.classList.add('stacked', stackRole === 'top' ? 'stack-top' : 'stack-member');
+    const match = this.query ? this.matchInfo?.get(record.id) : null;
+    if (isReply && match) element.classList.add('search-reply-hit');
+    const byCreator = isCreatorRecord(record, this.datasetStats?.metadata, this.datasetStats?.creatorHandle);
     const avatar = document.createElement('span');
-    avatar.className = 'avatar';
+    avatar.className = byCreator ? 'avatar creator-avatar' : 'avatar';
     avatar.setAttribute('aria-hidden', 'true');
     avatar.textContent = (record.author || '?').slice(0, 1).toUpperCase();
     const avatarUrl = safeAvatar(record.avatar);
@@ -650,12 +865,23 @@ export class CommentsView {
     const byline = document.createElement('div');
     byline.className = 'byline';
     const author = document.createElement('span');
-    author.className = 'author';
+    author.className = byCreator ? 'author creator-author' : 'author';
     author.textContent = '@' + (record.author || 'unknown');
     const published = document.createElement('span');
     published.className = 'published';
     published.textContent = record.published || '';
     byline.append(author, published);
+    if (match) {
+      const badge = document.createElement('span');
+      badge.className = 'match-badge' + (match.matchType === 'exact' || match.matchType === 'regex' ? ' exact' : match.semanticPct ? ' semantic' : '');
+      if (match.matchType === 'regex') badge.textContent = 'Regex';
+      else if (match.matchType === 'exact+semantic') badge.textContent = 'Exact · ' + match.semanticPct + '%';
+      else if (match.matchType === 'exact') badge.textContent = 'Exact';
+      else if (match.matchType === 'fuzzy+semantic') badge.textContent = 'Fuzzy · ' + match.semanticPct + '%';
+      else if (match.matchType === 'semantic') badge.textContent = 'Semantic ' + match.semanticPct + '%';
+      else badge.textContent = 'Fuzzy';
+      byline.append(badge);
+    }
     const text = document.createElement('div');
     text.className = 'comment-text';
     const actions = document.createElement('div');
@@ -666,6 +892,15 @@ export class CommentsView {
       likes.title = record.likes + ' likes';
       likes.append(svg('M7 10v10M7 10l5-7c2 0 2 2 2 3l-.5 4H19a2 2 0 0 1 2 2l-1.5 6a2 2 0 0 1-2 2H3v-9h4Z'), String(record.likes));
       actions.append(likes);
+    }
+    if (record.hearted === true) {
+      const heart = document.createElement('span');
+      heart.className = 'creator-heart';
+      heart.title = 'Hearted by the channel creator';
+      const icon = svg('M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z');
+      icon.classList.add('heart-fill');
+      heart.append(icon, 'Creator');
+      actions.append(heart);
     }
     const more = button('Read more', 'text-button', () => {
       if (this.full.has(record.id)) this.full.delete(record.id);
@@ -704,7 +939,7 @@ export class CommentsView {
       element.prepend(spacer);
     }
 
-    const row = { element, text, actions, more, record, displayed: null, clamp: null };
+    const row = { element, text, actions, more, record, displayed: null, highlightKey: '', clamp: null };
     this.nodes.set(record.id, row);
     return row;
   }
@@ -726,10 +961,12 @@ export class CommentsView {
         changed = true;
       }
       text.classList.toggle('clamped', clamp);
-      if (row.displayed !== value) {
+      const nextHighlightKey = this.highlightKey || '';
+      if (row.displayed !== value || row.highlightKey !== nextHighlightKey) {
         row.displayed = value;
+        row.highlightKey = nextHighlightKey;
         text.replaceChildren();
-        appendCommentText(text, value, this.key, this.duration, this.seek);
+        appendCommentText(text, value, this.key, this.duration, this.seek, this.highlightRegex);
         changed = true;
       }
     }

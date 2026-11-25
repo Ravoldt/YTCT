@@ -213,7 +213,33 @@
 
   function harvestEntities(data, parentId, fromCapture) {
     let added = 0;
-    for (const m of commentMutations(data)) {
+    const mutations = commentMutations(data);
+    const heartByKey = new Map();
+    for (const m of mutations) {
+      const ts = m?.payload?.engagementToolbarStateEntityPayload;
+      if (ts) {
+        const key = ts.key || m.entityKey;
+        if (key) heartByKey.set(key, ts.heartState === 'TOOLBAR_HEART_STATE_HEARTED');
+      }
+    }
+    const toolbarKeyByCommentId = new Map();
+    if (heartByKey.size) {
+      (function collectToolbarKeys(node, depth) {
+        if (!node || typeof node !== 'object' || depth > 35) return;
+        if (Array.isArray(node)) {
+          for (const item of node) collectToolbarKeys(item, depth + 1);
+          return;
+        }
+        const vm = node.commentViewModel;
+        if (vm && typeof vm === 'object' && vm.commentId && vm.toolbarStateKey) {
+          toolbarKeyByCommentId.set(vm.commentId, vm.toolbarStateKey);
+        }
+        for (const k in node) {
+          if (k !== 'frameworkUpdates') collectToolbarKeys(node[k], depth + 1);
+        }
+      })(data, 0);
+    }
+    for (const m of mutations) {
       const p = m?.payload?.commentEntityPayload;
       if (!p?.properties || (fromCapture && p.properties.replyLevel > 0)) continue;
       const cid = p.properties.commentId;
@@ -222,6 +248,11 @@
         if (!parentId && state.knownTopIds?.has(cid)) continue;
         if (parentId && state.knownAllIds?.has(cid)) continue;
       }
+      const published = p.properties.publishedTime || '';
+      const toolbarKey = p.properties.toolbarStateKey || toolbarKeyByCommentId.get(cid) || '';
+      const hearted = toolbarKey ? heartByKey.get(toolbarKey) === true : false;
+      const isCreator = p.author?.isCreator === true;
+      const edited = /\(edited\)/i.test(published);
       const comment = {
         id: cid,
         parent: parentId || null,
@@ -229,9 +260,12 @@
         authorChannelId: p.author?.channelId || '',
         avatar: p.author?.avatarThumbnailUrl || '',
         text: String(p.properties.content?.content || '').slice(0, 32768),
-        published: p.properties.publishedTime || '',
+        published,
         likes: p.toolbar?.likeCountNotliked || p.toolbar?.likeCountLiked || '0',
         replyCount: p.toolbar?.replyCount || '',
+        ...(hearted ? { hearted: true } : {}),
+        ...(isCreator ? { isCreator: true } : {}),
+        ...(edited ? { edited: true } : {}),
       };
       const bytes = encoder.encode(JSON.stringify(comment)).byteLength + 1;
       if (state.comments.size >= 50000 || state.commentBytes + bytes > MAX_COMMENT_BYTES) {

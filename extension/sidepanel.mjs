@@ -3,6 +3,9 @@ import { renderAnswer } from './answer-view.mjs';
 import { askOllama, loadedModel } from './ollama.mjs';
 import { askRemote, messageTokens } from './remote.mjs';
 import { normalizeEntry, normalizeTranscript } from './export-entry.mjs';
+import {
+  activeFilterList, countActiveFilters, defaultFilters, semanticModelSpec, validateRegex,
+} from './search-engine.mjs';
 // Provider presets and model discovery adapted from Cline (Apache-2.0).
 // See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
 import {
@@ -15,6 +18,11 @@ import {
 const byId = (id) => document.getElementById(id);
 const tabId = Number(new URLSearchParams(location.search).get('tab'));
 const query = byId('query');
+const searchField = byId('search-field');
+const regexToggleBtn = byId('regex-toggle');
+const filterToggleBtn = byId('filter-toggle');
+const filterDrawer = byId('filter-drawer');
+const searchStrengthEl = byId('search-strength');
 const askField = byId('ask-field');
 const askInput = byId('ask-input');
 const expandAskBtn = byId('expand-ask');
@@ -35,6 +43,32 @@ let askExpanded = false;
 let searchDraft = '';
 let questionDraft = '';
 let searchTimer;
+let regexHintTimer = null;
+let semanticQueryTimer = null;
+let searchMode = 'fuzzy';
+let searchIsRegex = false;
+let searchFilters = defaultFilters();
+let searchSort = 'likes';
+let searchSortPinned = false;
+let filterDrawerOpen = false;
+let savedPresets = [];
+let regexTimeoutError = '';
+let semanticError = '';
+let semanticIndexedKey = '';
+let semanticIndexing = false;
+let semanticStage = '';
+let semanticIndexRunSeq = 0;
+let semanticCancelledKey = '';
+let semanticCancelNote = '';
+let semanticLastDone = 0;
+let semanticLastTotal = 0;
+let semanticBackend = '';
+let lastFilterSummary = null;
+let searchWorker = null;
+let workerReqSeq = 0;
+let activeRegexReqId = 0;
+let activeSemanticReqId = 0;
+const workerPending = new Map();
 let settings = YTCT.settingsDefaults;
 let llm = defaultLlmConfig();
 let llmEditingId = null;
@@ -81,6 +115,10 @@ const viewer = new CommentsView({
   list: byId('comments'), count: byId('count'), follow: byId('follow'),
   timestampOnly: byId('timestamp-only'), playhead: byId('playhead-time'),
   seek: (seconds) => tab('seek', { seconds }),
+  onFilterChange: (summary) => {
+    lastFilterSummary = summary;
+    renderSearchMetaAndDiagnostics();
+  },
 });
 const actions = {
   seek: (seconds) => tab('seek', { seconds }),
@@ -176,17 +214,683 @@ function clearChat() {
   updateComposer();
 }
 
-function resizeAskInput() {
-  if (askExpanded || mode !== 'ai') return;
-  askInput.style.height = 'auto';
-  const style = getComputedStyle(askInput);
+function resizeTextarea(el) {
+  if (!el) return;
+  el.style.height = 'auto';
+  const style = getComputedStyle(el);
   const lineHeight = parseFloat(style.lineHeight) || (parseFloat(style.fontSize) || 14) * 1.45;
   const paddingY = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0);
   const borderY = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
   const maxHeight = Math.ceil(lineHeight * 4 + paddingY + borderY);
-  const scrollHeight = askInput.scrollHeight;
-  askInput.style.height = Math.min(scrollHeight, maxHeight) + 'px';
-  askInput.style.overflowY = scrollHeight > maxHeight + 1 ? 'auto' : 'hidden';
+  const scrollHeight = el.scrollHeight;
+  el.style.height = Math.min(scrollHeight, maxHeight) + 'px';
+  el.style.overflowY = scrollHeight > maxHeight + 1 ? 'auto' : 'hidden';
+}
+
+function resizeAskInput() {
+  if (askExpanded || mode !== 'ai') return;
+  resizeTextarea(askInput);
+}
+
+function resizeSearchInput() {
+  if (mode !== 'search') return;
+  resizeTextarea(query);
+}
+
+// ------------------------------------------------------------------ search worker & semantic/regex engine
+function killSearchWorker() {
+  if (searchWorker) {
+    try { searchWorker.terminate(); } catch {}
+    searchWorker = null;
+  }
+  for (const req of workerPending.values()) {
+    clearTimeout(req.timer);
+    req.reject(new Error('Search worker reset.'));
+  }
+  workerPending.clear();
+  semanticIndexRunSeq++;
+  semanticIndexedKey = '';
+  semanticIndexing = false;
+  semanticStage = '';
+  byId('embed-progress').hidden = true;
+  const cancelBtn = byId('cancel-embed');
+  if (cancelBtn) { cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel'; }
+}
+
+function getSearchWorker() {
+  if (searchWorker) return searchWorker;
+  searchWorker = new Worker(new URL('./search-worker.mjs', import.meta.url), { type: 'module' });
+  searchWorker.onmessage = (event) => {
+    const msg = event.data;
+    if (!msg || typeof msg !== 'object') return;
+    if (msg.type === 'semantic-progress') {
+      if (!semanticIndexing) return;
+      const box = byId('embed-progress');
+      const label = byId('embed-progress-label');
+      const pctEl = byId('embed-progress-pct');
+      const fill = byId('embed-progress-fill');
+      box.hidden = false;
+      if (msg.stage === 'downloading') {
+        semanticStage = 'downloading';
+        const pct = Number(msg.pct) || 0;
+        label.textContent = 'Downloading ' + (msg.modelLabel || 'embedding model') + '…';
+        pctEl.textContent = pct + '%';
+        fill.style.width = pct + '%';
+      } else if (msg.stage === 'indexing') {
+        semanticStage = 'indexing';
+        const total = Math.max(1, Number(msg.total) || 1);
+        const done = Math.min(total, Number(msg.done) || 0);
+        semanticLastDone = done;
+        semanticLastTotal = total;
+        const pct = Math.round((done / total) * 100);
+        label.textContent = 'Indexing comments on ' + (msg.backend || 'browser') + ' (' + done.toLocaleString() + ' / ' + total.toLocaleString() + ')…';
+        pctEl.textContent = pct + '%';
+        fill.style.width = pct + '%';
+      }
+      return;
+    }
+    const req = workerPending.get(msg.requestId);
+    if (!req) return;
+    clearTimeout(req.timer);
+    workerPending.delete(msg.requestId);
+    if (msg.type === 'error') req.reject(new Error(msg.error || 'Search worker failed.'));
+    else req.resolve(msg);
+  };
+  searchWorker.onerror = () => {
+    killSearchWorker();
+  };
+  return searchWorker;
+}
+
+function postSearchWorker(payload, timeoutMs = 0) {
+  const w = getSearchWorker();
+  const requestId = ++workerReqSeq;
+  return new Promise((resolve, reject) => {
+    const timer = timeoutMs > 0 ? setTimeout(() => {
+      workerPending.delete(requestId);
+      reject(Object.assign(new Error('TIMEOUT'), { code: 'TIMEOUT' }));
+    }, timeoutMs) : null;
+    workerPending.set(requestId, { resolve, reject, timer });
+    w.postMessage({ ...payload, requestId });
+  });
+}
+
+function hideRegexErrorTip() {
+  clearTimeout(regexHintTimer);
+  regexHintTimer = null;
+  const tip = byId('regex-error-tip');
+  tip.hidden = true;
+  tip.textContent = '';
+  query.classList.remove('invalid');
+}
+
+function showRegexErrorTip(message) {
+  const tip = byId('regex-error-tip');
+  tip.textContent = 'Invalid regex: ' + message + ' — no results can match until fixed.';
+  tip.hidden = false;
+  query.classList.add('invalid');
+}
+
+function scheduleRegexValidation(immediate = false) {
+  hideRegexErrorTip();
+  if (!searchIsRegex || mode !== 'search') return true;
+  const pattern = query.value.trim();
+  if (!pattern) return true;
+  const check = validateRegex(pattern);
+  if (check.ok) return true;
+  if (immediate) {
+    showRegexErrorTip(check.error);
+  } else {
+    regexHintTimer = setTimeout(() => {
+      regexHintTimer = null;
+      if (!searchIsRegex || mode !== 'search') return;
+      const recheck = validateRegex(query.value.trim());
+      if (!recheck.ok) showRegexErrorTip(recheck.error);
+    }, 3000);
+  }
+  return false;
+}
+
+function semanticKeyForState() {
+  if (!state?.entry) return '';
+  return [
+    state.key,
+    state.entry.snapshot?.exportedAt || '',
+    YTCT.commentsFromExport(state.entry).length,
+    settings.semanticModel || 'arctic-xs',
+    settings.semanticDevice || 'auto',
+  ].join('|');
+}
+
+async function cancelSemanticIndexing({ silent = false } = {}) {
+  const wasIndexing = semanticIndexing;
+  const wasStage = semanticStage;
+  const key = semanticKeyForState();
+  const doneBefore = semanticLastDone;
+  const totalBefore = semanticLastTotal;
+  const cancelBtn = byId('cancel-embed');
+  if (cancelBtn) {
+    cancelBtn.disabled = true;
+    cancelBtn.textContent = 'Cancelling…';
+  }
+  if (!silent && key) semanticCancelledKey = key;
+  if (wasIndexing && searchWorker) {
+    if (wasStage === 'indexing') {
+      // Let the worker finish its current small batch and flush completed vectors to IndexedDB.
+      try {
+        await postSearchWorker({ type: 'semantic-cancel' }, 4000);
+      } catch {
+        killSearchWorker();
+      }
+    } else {
+      // During model prep or download, terminate immediately so in-flight network requests abort cleanly.
+      killSearchWorker();
+    }
+  }
+  semanticIndexing = false;
+  semanticStage = '';
+  byId('embed-progress').hidden = true;
+  if (cancelBtn) {
+    cancelBtn.disabled = false;
+    cancelBtn.textContent = 'Cancel';
+  }
+  if (!silent) {
+    const done = Math.max(doneBefore, semanticLastDone);
+    const total = Math.max(totalBefore, semanticLastTotal);
+    semanticCancelNote = wasStage === 'indexing' && done > 0 && total > 0
+      ? 'Indexing paused (' + done.toLocaleString() + ' / ' + total.toLocaleString() + ' comments saved locally).'
+      : 'Semantic search indexing cancelled.';
+    renderSearchMetaAndDiagnostics();
+  }
+}
+
+async function ensureSemanticIndexed({ force = false } = {}) {
+  if (!state?.entry || !settings.semanticSearchEnabled || searchMode !== 'semantic' || searchIsRegex) return false;
+  const key = semanticKeyForState();
+  if (!key) return false;
+  if (semanticIndexedKey === key) return true;
+  if (!force && semanticCancelledKey === key) return false;
+  if (semanticIndexing) return false;
+  const runSeq = ++semanticIndexRunSeq;
+  semanticIndexing = true;
+  semanticStage = 'preparing';
+  semanticCancelledKey = '';
+  semanticCancelNote = '';
+  semanticError = '';
+  semanticLastDone = 0;
+  semanticLastTotal = 0;
+  renderSearchMetaAndDiagnostics();
+  const box = byId('embed-progress');
+  const cancelBtn = byId('cancel-embed');
+  if (cancelBtn) { cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel'; }
+  byId('embed-progress-label').textContent = 'Preparing ' + semanticModelSpec(settings.semanticModel).label + '…';
+  byId('embed-progress-pct').textContent = '0%';
+  byId('embed-progress-fill').style.width = '0%';
+  box.hidden = false;
+  try {
+    const items = viewer.getAllIndexableRecords();
+    semanticLastTotal = items.length;
+    const res = await postSearchWorker({
+      type: 'semantic-index',
+      modelKey: settings.semanticModel || 'arctic-xs',
+      device: settings.semanticDevice || 'auto',
+      items,
+    });
+    if (runSeq !== semanticIndexRunSeq) return false;
+    if (res?.type === 'semantic-cancelled') {
+      if (Number.isFinite(res.done)) semanticLastDone = res.done;
+      if (Number.isFinite(res.total)) semanticLastTotal = res.total;
+      return false;
+    }
+    if (semanticKeyForState() !== key) return false;
+    semanticIndexedKey = key;
+    semanticBackend = res.backend || '';
+    updateSearchUi();
+    if (query.value.trim() && searchMode === 'semantic' && !searchIsRegex) runSemanticQuery();
+    return true;
+  } catch (error) {
+    if (runSeq === semanticIndexRunSeq && error.message !== 'Search worker reset.') {
+      semanticError = 'Semantic search failed to initialize: ' + error.message;
+      renderSearchMetaAndDiagnostics();
+    }
+    return false;
+  } finally {
+    if (runSeq === semanticIndexRunSeq) {
+      box.hidden = true;
+      semanticIndexing = false;
+      semanticStage = '';
+      if (cancelBtn) { cancelBtn.disabled = false; cancelBtn.textContent = 'Cancel'; }
+    }
+  }
+}
+
+async function runSemanticQuery() {
+  if (!state?.entry || !settings.semanticSearchEnabled || searchMode !== 'semantic' || searchIsRegex) return;
+  const q = query.value.trim();
+  if (!q) {
+    viewer.setSearchState({ semanticScores: null });
+    return;
+  }
+  const key = semanticKeyForState();
+  if (semanticIndexedKey !== key) {
+    await ensureSemanticIndexed();
+    return;
+  }
+  const reqSeq = ++activeSemanticReqId;
+  const candidateIds = viewer.getCandidateRecords().map((item) => item.id);
+  try {
+    const res = await postSearchWorker({
+      type: 'semantic-query',
+      modelKey: settings.semanticModel || 'arctic-xs',
+      device: settings.semanticDevice || 'auto',
+      query: q,
+      candidateIds,
+    }, 30000);
+    if (reqSeq !== activeSemanticReqId || searchMode !== 'semantic' || searchIsRegex || query.value.trim() !== q) return;
+    semanticError = '';
+    viewer.setSearchState({
+      query: q,
+      searchMode: 'semantic',
+      isRegex: false,
+      filters: searchFilters,
+      sort: searchSort,
+      sortPinned: searchSortPinned,
+      semanticScores: new Map(res.scores || []),
+    });
+  } catch (error) {
+    if (reqSeq !== activeSemanticReqId) return;
+    if (error.message !== 'Search worker reset.') {
+      semanticError = 'Semantic search error: ' + error.message;
+      renderSearchMetaAndDiagnostics();
+    }
+  }
+}
+
+async function runWorkerRegexSearch(pattern) {
+  const reqSeq = ++activeRegexReqId;
+  regexTimeoutError = '';
+  const items = viewer.getCandidateRecords();
+  try {
+    const res = await postSearchWorker({ type: 'regex-search', pattern, items }, 500);
+    if (reqSeq !== activeRegexReqId || !searchIsRegex || query.value.trim() !== pattern) return;
+    viewer.setSearchState({
+      query: pattern,
+      searchMode,
+      isRegex: true,
+      filters: searchFilters,
+      sort: searchSort,
+      sortPinned: searchSortPinned,
+      regexHitIds: new Set(res.hitIds || []),
+    });
+  } catch (error) {
+    if (reqSeq !== activeRegexReqId) return;
+    if (error.code === 'TIMEOUT') {
+      killSearchWorker();
+      regexTimeoutError = 'Regex took too long to evaluate — simplify nested quantifiers.';
+      viewer.setSearchState({
+        query: pattern,
+        searchMode,
+        isRegex: true,
+        filters: searchFilters,
+        sort: searchSort,
+        sortPinned: searchSortPinned,
+        regexHitIds: new Set(),
+      });
+      renderSearchMetaAndDiagnostics();
+    }
+  }
+}
+
+function applySearchNow({ immediateRegexHint = false } = {}) {
+  clearTimeout(searchTimer);
+  clearTimeout(semanticQueryTimer);
+  regexTimeoutError = '';
+  const q = mode === 'search' ? query.value.trim() : '';
+  if (searchIsRegex) {
+    const valid = scheduleRegexValidation(immediateRegexHint);
+    if (!q) {
+      viewer.setSearchState({ query: '', searchMode, isRegex: true, filters: searchFilters, sort: searchSort, sortPinned: searchSortPinned, regexHitIds: null, semanticScores: null });
+      updateSearchUi();
+      return;
+    }
+    if (!valid) {
+      viewer.setSearchState({ query: q, searchMode, isRegex: true, filters: searchFilters, sort: searchSort, sortPinned: searchSortPinned, regexHitIds: new Set(), semanticScores: null });
+      updateSearchUi();
+      return;
+    }
+    updateSearchUi();
+    if (state?.entry) runWorkerRegexSearch(q);
+    return;
+  }
+  hideRegexErrorTip();
+  viewer.setSearchState({
+    query: q,
+    searchMode,
+    isRegex: false,
+    filters: searchFilters,
+    sort: searchSort,
+    sortPinned: searchSortPinned,
+    regexHitIds: null,
+    semanticScores: searchMode === 'semantic' ? viewer.semanticScores : null,
+  });
+  updateSearchUi();
+  if (searchMode === 'semantic' && settings.semanticSearchEnabled && state?.entry) {
+    if (semanticIndexedKey !== semanticKeyForState()) {
+      ensureSemanticIndexed();
+    } else if (q) {
+      semanticQueryTimer = setTimeout(runSemanticQuery, 200);
+    }
+  }
+}
+
+function updateSearchUi() {
+  const placeholder = searchIsRegex
+    ? 'Enter regex pattern'
+    : searchMode === 'exact' ? 'Search comments (exact)'
+      : searchMode === 'semantic' ? 'Search comments by meaning'
+        : 'Search comments';
+  query.placeholder = placeholder;
+  query.setAttribute('aria-label', placeholder);
+  regexToggleBtn.setAttribute('aria-pressed', String(searchIsRegex));
+  searchStrengthEl.classList.toggle('regex-override', searchIsRegex);
+  for (const btn of searchStrengthEl.querySelectorAll('button[data-search-mode]')) {
+    btn.setAttribute('aria-pressed', String(btn.dataset.searchMode === searchMode));
+  }
+  const activeCount = countActiveFilters(searchFilters);
+  filterToggleBtn.setAttribute('aria-expanded', String(filterDrawerOpen));
+  filterToggleBtn.classList.toggle('has-filters', activeCount > 0);
+  filterDrawer.hidden = !filterDrawerOpen || mode !== 'search';
+  const countEl = byId('filter-count');
+  countEl.hidden = activeCount === 0;
+  countEl.textContent = String(activeCount);
+  const channelName = viewer.getDatasetStats()?.channelName || '';
+  const mentionsBtn = filterDrawer.querySelector('[data-filter-toggle="mentionsCreator"]');
+  if (mentionsBtn) mentionsBtn.textContent = channelName ? 'Mentions ' + channelName : 'Mentions creator';
+  for (const btn of filterDrawer.querySelectorAll('[data-filter-toggle]')) {
+    btn.setAttribute('aria-pressed', String(!!searchFilters[btn.dataset.filterToggle]));
+  }
+  byId('f-min-likes').value = searchFilters.minLikes;
+  byId('f-max-likes').value = searchFilters.maxLikes;
+  byId('f-min-replies').value = searchFilters.minReplies;
+  byId('f-max-replies').value = searchFilters.maxReplies;
+  byId('f-author').value = searchFilters.author;
+}
+
+function renderSearchMetaAndDiagnostics() {
+  const summary = lastFilterSummary;
+  const channelName = summary?.stats?.channelName || '';
+  const activeList = activeFilterList(searchFilters, channelName);
+  const showMeta = !!state?.entry && (summary?.hasQuery || activeList.length > 0);
+  const metaBox = byId('search-meta');
+  metaBox.hidden = !showMeta;
+  if (showMeta) {
+    const left = byId('search-meta-left');
+    left.replaceChildren();
+    const countSpan = document.createElement('span');
+    const n = summary?.matchedThreads || 0;
+    countSpan.textContent = n.toLocaleString() + (n === 1 ? ' thread' : ' threads');
+    left.append(countSpan);
+    for (const [key, label] of activeList) {
+      const tag = document.createElement('span');
+      tag.className = 'active-tag';
+      tag.textContent = label + ' ';
+      const x = document.createElement('button');
+      x.type = 'button';
+      x.textContent = '×';
+      x.setAttribute('aria-label', 'Remove ' + label);
+      x.addEventListener('click', () => {
+        searchFilters[key] = typeof searchFilters[key] === 'boolean' ? false : '';
+        applySearchNow();
+      });
+      tag.append(x);
+      left.append(tag);
+    }
+    const sortGroup = byId('sort-group');
+    const showSort = !!summary?.hasQuery && !byId('timestamp-only').checked;
+    sortGroup.hidden = !showSort;
+    if (showSort) {
+      for (const btn of sortGroup.querySelectorAll('button[data-sort]')) {
+        btn.setAttribute('aria-pressed', String(btn.dataset.sort === summary.effectiveSort));
+      }
+    }
+  }
+
+  // Diagnostic banner: semantic opt-in prompt, regex timeout, semantic error, or OOB/conflict filters.
+  const banner = byId('search-diagnostic');
+  let diag = null;
+  if (regexTimeoutError) {
+    diag = { kind: 'error', text: regexTimeoutError, actions: [{ label: 'Exit regex mode', fn: () => { searchIsRegex = false; applySearchNow(); } }] };
+  } else if (semanticError && searchMode === 'semantic' && !searchIsRegex) {
+    diag = {
+      kind: 'error',
+      text: semanticError,
+      actions: [
+        { label: 'Retry', solid: true, fn: () => { semanticError = ''; ensureSemanticIndexed({ force: true }); } },
+        { label: 'Switch to Fuzzy', fn: () => { semanticError = ''; searchMode = 'fuzzy'; applySearchNow(); } },
+      ],
+    };
+  } else if (semanticCancelNote && searchMode === 'semantic' && !searchIsRegex && settings.semanticSearchEnabled && !semanticIndexing && mode === 'search') {
+    diag = {
+      kind: 'info',
+      text: semanticCancelNote,
+      actions: [
+        { label: 'Resume indexing', solid: true, fn: () => { ensureSemanticIndexed({ force: true }); } },
+        { label: 'Switch to Fuzzy', fn: () => { semanticCancelNote = ''; semanticCancelledKey = ''; searchMode = 'fuzzy'; applySearchNow(); } },
+      ],
+    };
+  } else if (searchMode === 'semantic' && !searchIsRegex && !settings.semanticSearchEnabled && mode === 'search') {
+    const spec = semanticModelSpec(settings.semanticModel);
+    diag = {
+      kind: 'info',
+      text: 'Semantic search is off by default. Enabling downloads ' + spec.label + ' and the ONNX WebAssembly runtime on first use (cached locally). Comments never leave your device.',
+      actions: [
+        {
+          label: 'Enable & download (~' + spec.sizeMB + ' MB)',
+          solid: true,
+          fn: async () => {
+            try {
+              const saved = (await worker('settings', { values: { ...settings, semanticSearchEnabled: true } })).settings;
+              settings = saved;
+              viewer.setSettings(settings);
+              applySearchNow();
+            } catch (err) { notice(err.message); }
+          },
+        },
+        { label: 'Search settings', fn: () => { settingsTab = 'search'; showSettings(); } },
+      ],
+    };
+  } else if (summary?.diagnosis) {
+    const d = summary.diagnosis;
+    diag = {
+      kind: 'warn',
+      text: d.text,
+      actions: d.clearKeys?.length ? [{
+        label: 'Clear filter',
+        fn: () => {
+          for (const k of d.clearKeys) searchFilters[k] = typeof searchFilters[k] === 'boolean' ? false : '';
+          applySearchNow();
+        },
+      }] : [],
+    };
+  }
+
+  if (!diag) {
+    banner.hidden = true;
+    banner.replaceChildren();
+    return;
+  }
+  banner.hidden = false;
+  banner.className = 'search-diagnostic' + (diag.kind === 'error' ? ' error' : diag.kind === 'info' ? ' info' : '');
+  banner.replaceChildren();
+  const p = document.createElement('p');
+  p.textContent = diag.text;
+  banner.append(p);
+  if (diag.actions?.length) {
+    const row = document.createElement('div');
+    row.className = 'diagnostic-actions';
+    for (const act of diag.actions) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'mini-btn' + (act.solid ? ' solid' : '');
+      btn.textContent = act.label;
+      btn.addEventListener('click', act.fn);
+      row.append(btn);
+    }
+    banner.append(row);
+  }
+}
+
+function renderSavedPresets() {
+  const drawerSection = byId('drawer-presets-section');
+  const drawerList = byId('drawer-preset-list');
+  drawerSection.hidden = savedPresets.length === 0;
+  drawerList.replaceChildren();
+  for (const preset of savedPresets) {
+    const chip = document.createElement('span');
+    chip.className = 'preset-chip';
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'link-btn';
+    applyBtn.style.padding = '0';
+    applyBtn.style.color = 'inherit';
+    applyBtn.textContent = preset.name;
+    applyBtn.title = 'Apply preset “' + preset.name + '”';
+    applyBtn.addEventListener('click', () => {
+      searchFilters = { ...defaultFilters(), ...(preset.filters || {}) };
+      searchIsRegex = !!preset.isRegex;
+      if (preset.mode && ['exact', 'fuzzy', 'semantic'].includes(preset.mode)) searchMode = preset.mode;
+      query.value = preset.query || '';
+      resizeSearchInput();
+      applySearchNow();
+    });
+    const delBtn = document.createElement('button');
+    delBtn.type = 'button';
+    delBtn.className = 'preset-chip-del';
+    delBtn.textContent = '×';
+    delBtn.setAttribute('aria-label', 'Delete preset ' + preset.name);
+    delBtn.addEventListener('click', () => deleteSearchPreset(preset.id));
+    chip.append(applyBtn, delBtn);
+    drawerList.append(chip);
+  }
+
+  const settingsBox = byId('settings-presets-list');
+  if (settingsBox) {
+    settingsBox.replaceChildren();
+    if (!savedPresets.length) {
+      const empty = document.createElement('p');
+      empty.className = 'hint';
+      empty.textContent = 'No saved filter presets yet. Save one from the Filters drawer.';
+      settingsBox.append(empty);
+    } else {
+      for (const preset of savedPresets) {
+        const row = document.createElement('div');
+        row.className = 'settings-preset-row';
+        const label = document.createElement('span');
+        label.textContent = preset.name;
+        const del = document.createElement('button');
+        del.type = 'button';
+        del.className = 'link-btn';
+        del.textContent = 'Delete';
+        del.addEventListener('click', () => deleteSearchPreset(preset.id));
+        row.append(label, del);
+        settingsBox.append(row);
+      }
+    }
+  }
+}
+
+async function loadSearchPresets() {
+  try {
+    savedPresets = await worker('search-presets', { action: 'list' }) || [];
+    renderSavedPresets();
+  } catch {}
+}
+
+async function saveSearchPreset(name) {
+  const cleanName = String(name || '').trim().slice(0, 60);
+  if (!cleanName) return;
+  try {
+    savedPresets = await worker('search-presets', {
+      action: 'save',
+      preset: {
+        name: cleanName,
+        query: query.value.trim(),
+        isRegex: searchIsRegex,
+        mode: searchMode,
+        filters: { ...searchFilters },
+      },
+    }) || [];
+    renderSavedPresets();
+  } catch (err) { notice(err.message); }
+}
+
+async function deleteSearchPreset(id) {
+  try {
+    savedPresets = await worker('search-presets', { action: 'delete', id }) || [];
+    renderSavedPresets();
+  } catch (err) { notice(err.message); }
+}
+
+async function refreshEmbeddingCacheInfo() {
+  const el = byId('search-cache-usage');
+  if (!el) return;
+  try {
+    const res = await postSearchWorker({ type: 'semantic-cache-info' }, 5000);
+    const modelMB = (res.stats?.modelBytes || 0) / 1e6;
+    const vecMB = (res.stats?.vectorBytes || 0) / 1e6;
+    const count = res.stats?.vectorCount || 0;
+    if (modelMB < 0.05 && count === 0) {
+      el.textContent = 'No embedding model or vectors cached yet.';
+    } else {
+      el.textContent = 'Cached locally: ' + modelMB.toFixed(1) + ' MB model/runtime · '
+        + vecMB.toFixed(1) + ' MB vectors (' + count.toLocaleString() + ' comments).';
+    }
+  } catch {
+    el.textContent = 'No embedding model or vectors cached yet.';
+  }
+}
+
+async function clearIndexedComments() {
+  const usageEl = byId('search-cache-usage');
+  try {
+    if (semanticIndexing) await cancelSemanticIndexing({ silent: true });
+    try {
+      await postSearchWorker({ type: 'semantic-clear-vectors' }, 10000);
+    } catch {
+      killSearchWorker();
+      await postSearchWorker({ type: 'semantic-clear-vectors' }, 10000);
+    }
+    semanticIndexedKey = '';
+    semanticCancelledKey = '';
+    semanticCancelNote = '';
+    semanticError = '';
+    viewer.setSearchState({ semanticScores: null });
+    await refreshEmbeddingCacheInfo();
+    if (usageEl) usageEl.textContent = 'Indexed comments cleared. ' + usageEl.textContent;
+  } catch (err) {
+    if (usageEl) usageEl.textContent = 'Could not clear indexed comments: ' + err.message;
+  }
+}
+
+async function clearDownloadedModels() {
+  const usageEl = byId('search-cache-usage');
+  try {
+    if (semanticIndexing) await cancelSemanticIndexing({ silent: true });
+    try {
+      await postSearchWorker({ type: 'semantic-clear-models' }, 10000);
+    } catch {
+      killSearchWorker();
+      if (typeof caches !== 'undefined') await caches.delete('transformers-cache').catch(() => {});
+    }
+    semanticIndexedKey = '';
+    semanticCancelledKey = '';
+    semanticCancelNote = '';
+    semanticError = '';
+    await refreshEmbeddingCacheInfo();
+    if (usageEl) usageEl.textContent = 'Downloaded models cleared. ' + usageEl.textContent;
+  } catch (err) {
+    if (usageEl) usageEl.textContent = 'Could not clear downloaded models: ' + err.message;
+  }
 }
 
 function setAskExpanded(expanded) {
@@ -210,21 +914,32 @@ function setMode(next) {
   mode = next;
   const ai = mode === 'ai';
   if (!ai) setAskExpanded(false);
+  else {
+    hideRegexErrorTip();
+    if (semanticIndexing) cancelSemanticIndexing({ silent: true });
+  }
   byId('ai').hidden = !ai;
-  query.hidden = ai;
+  searchField.hidden = ai;
+  filterToggleBtn.hidden = ai;
+  searchStrengthEl.hidden = ai;
+  filterDrawer.hidden = ai || !filterDrawerOpen;
   askField.hidden = !ai;
   byId('send').hidden = !ai;
   byId('search-mode').setAttribute('aria-pressed', String(!ai));
   byId('ai-mode').setAttribute('aria-pressed', String(ai));
   if (ai) askInput.value = questionDraft;
   else query.value = searchDraft;
-  viewer.setQuery(ai ? '' : searchDraft);
-  if (!ai) stopAsking();
-  else {
+  if (ai) {
+    viewer.setSearchState({ query: '' });
     applyAssistantName();
     chat.scrollTop = chat.scrollHeight;
     resizeAskInput();
     requestAnimationFrame(resizeAskInput);
+  } else {
+    stopAsking();
+    resizeSearchInput();
+    requestAnimationFrame(resizeSearchInput);
+    applySearchNow();
   }
   updateComposer();
 }
@@ -279,12 +994,35 @@ function startCountPolling(current, checkImmediately = false) {
 function resetView(info) {
   stopAsking();
   stopCountPolling();
+  hideRegexErrorTip();
+  clearTimeout(searchTimer);
+  clearTimeout(semanticQueryTimer);
   setAskExpanded(false);
+  filterDrawerOpen = false;
+  byId('preset-save-row').hidden = true;
+  searchFilters = defaultFilters();
+  searchIsRegex = false;
+  searchSort = 'likes';
+  searchSortPinned = false;
+  searchMode = settings.defaultSearchMode === 'exact' ? 'exact' : 'fuzzy';
+  regexTimeoutError = '';
+  semanticError = '';
+  semanticIndexRunSeq++;
+  semanticIndexedKey = '';
+  semanticCancelledKey = '';
+  semanticCancelNote = '';
+  semanticIndexing = false;
+  semanticStage = '';
+  semanticLastDone = 0;
+  semanticLastTotal = 0;
+  byId('embed-progress').hidden = true;
+  if (searchWorker) searchWorker.postMessage({ type: 'semantic-reset-memory' });
   setMode('search');
   searchDraft = '';
   questionDraft = '';
   query.value = '';
   askInput.value = '';
+  resizeSearchInput();
   history = [];
   historyDestination = '';
   historyHasTranscript = false;
@@ -300,6 +1038,8 @@ function resetView(info) {
     request.reject(new Error('YouTube source changed.'));
   }
   pending.clear();
+  updateSearchUi();
+  renderSearchMetaAndDiagnostics();
   updatePageHeader();
   updateComposer();
   if (!state) viewer.showEmpty('Open a YouTube video or community post.');
@@ -369,6 +1109,10 @@ function adoptEntry(entry, { checkNow = false } = {}) {
   newCommentsCount = 0;
   if (entry.snapshot?.exportedAt !== previous?.snapshot?.exportedAt || entry.markdown !== previous?.markdown || !previous) {
     viewer.load(entry);
+    updateSearchUi();
+    if (searchMode === 'semantic' && settings.semanticSearchEnabled && !searchIsRegex) {
+      ensureSemanticIndexed();
+    }
   }
   updatePageHeader();
   updateComposer();
@@ -966,6 +1710,7 @@ async function showSettings() {
 
 async function saveSettings(event) {
   event.preventDefault();
+  const previous = settings;
   const values = { ...settings };
   for (const name of Object.keys(YTCT.settingsDefaults)) {
     const input = config.elements.namedItem(name);
@@ -976,6 +1721,19 @@ async function saveSettings(event) {
     settings = (await worker('settings', { values })).settings;
     viewer.setSettings(settings);
     byId('telemetry').hidden = !settings.debugOllama;
+    if (previous.semanticModel !== settings.semanticModel || previous.semanticDevice !== settings.semanticDevice || !settings.semanticSearchEnabled) {
+      if (semanticIndexing) await cancelSemanticIndexing({ silent: true });
+      semanticIndexedKey = '';
+      semanticCancelledKey = '';
+      semanticCancelNote = '';
+      viewer.setSearchState({ semanticScores: null });
+    }
+    if (!settings.semanticSearchEnabled && searchMode === 'semantic') {
+      searchMode = settings.defaultSearchMode === 'exact' ? 'exact' : 'fuzzy';
+    } else if (previous.defaultSearchMode !== settings.defaultSearchMode && !query.value.trim() && searchMode !== 'semantic') {
+      searchMode = settings.defaultSearchMode;
+    }
+    applySearchNow();
     closeSettings();
   } catch (error) { settingsError(error.message); }
 }
@@ -987,11 +1745,13 @@ function settingsError(text) {
 
 // ------------------------------------------------------------------ settings tabs and LLM profiles
 function setSettingsTab(name) {
-  settingsTab = name === 'llm' ? 'llm' : 'general';
+  settingsTab = name === 'llm' ? 'llm' : name === 'search' ? 'search' : 'general';
   const llmActive = settingsTab === 'llm';
+  const searchActive = settingsTab === 'search';
   if (!llmActive) clearLlmKeyReveal();
   for (const [tab, panel, active] of [
-    [byId('settings-tab-general'), byId('settings-general'), !llmActive],
+    [byId('settings-tab-general'), byId('settings-general'), settingsTab === 'general'],
+    [byId('settings-tab-search'), byId('settings-search'), searchActive],
     [byId('settings-tab-llm'), byId('settings-llm'), llmActive],
   ]) {
     tab.setAttribute('aria-selected', String(active));
@@ -999,6 +1759,10 @@ function setSettingsTab(name) {
     panel.hidden = !active;
   }
   if (llmActive) renderLlmSettings();
+  if (searchActive) {
+    renderSavedPresets();
+    refreshEmbeddingCacheInfo();
+  }
 }
 
 function profileOptionLabel(profile) {
@@ -1783,6 +2547,7 @@ askHandle.addEventListener('keydown', (event) => {
 window.addEventListener('resize', () => {
   setAskHeight(askHeight);
   resizeAskInput();
+  resizeSearchInput();
 });
 
 byId('search-mode').addEventListener('click', () => setMode('search'));
@@ -1791,6 +2556,98 @@ expandAskBtn.addEventListener('click', () => {
   setAskExpanded(!askExpanded);
   askInput.focus();
 });
+regexToggleBtn.addEventListener('click', () => {
+  searchIsRegex = !searchIsRegex;
+  if (searchIsRegex && semanticIndexing) cancelSemanticIndexing({ silent: true });
+  applySearchNow();
+  query.focus();
+});
+for (const btn of searchStrengthEl.querySelectorAll('button[data-search-mode]')) {
+  btn.addEventListener('click', () => {
+    const nextMode = btn.dataset.searchMode;
+    if (nextMode !== 'semantic' && semanticIndexing) cancelSemanticIndexing({ silent: true });
+    searchIsRegex = false;
+    searchMode = nextMode;
+    semanticError = '';
+    if (nextMode === 'semantic') {
+      semanticCancelledKey = '';
+      semanticCancelNote = '';
+    }
+    applySearchNow();
+  });
+}
+for (const btn of byId('sort-group').querySelectorAll('button[data-sort]')) {
+  btn.addEventListener('click', () => {
+    searchSort = btn.dataset.sort;
+    searchSortPinned = true;
+    applySearchNow();
+  });
+}
+filterToggleBtn.addEventListener('click', () => {
+  filterDrawerOpen = !filterDrawerOpen;
+  if (!filterDrawerOpen) byId('preset-save-row').hidden = true;
+  updateSearchUi();
+});
+byId('close-filters').addEventListener('click', () => {
+  filterDrawerOpen = false;
+  byId('preset-save-row').hidden = true;
+  updateSearchUi();
+});
+byId('clear-filters').addEventListener('click', () => {
+  searchFilters = defaultFilters();
+  applySearchNow();
+});
+byId('save-preset-btn').addEventListener('click', () => {
+  const row = byId('preset-save-row');
+  const input = byId('preset-name-input');
+  row.hidden = false;
+  input.value = '';
+  input.focus();
+});
+byId('preset-save-cancel').addEventListener('click', () => {
+  byId('preset-save-row').hidden = true;
+});
+byId('preset-save-confirm').addEventListener('click', async () => {
+  const input = byId('preset-name-input');
+  if (!input.value.trim()) { input.focus(); return; }
+  await saveSearchPreset(input.value);
+  byId('preset-save-row').hidden = true;
+});
+byId('preset-name-input').addEventListener('keydown', async (event) => {
+  if (event.key === 'Escape') {
+    event.preventDefault();
+    byId('preset-save-row').hidden = true;
+  } else if (event.key === 'Enter') {
+    event.preventDefault();
+    const input = event.target;
+    if (!input.value.trim()) return;
+    await saveSearchPreset(input.value);
+    byId('preset-save-row').hidden = true;
+  }
+});
+for (const btn of filterDrawer.querySelectorAll('[data-filter-toggle]')) {
+  btn.addEventListener('click', () => {
+    const key = btn.dataset.filterToggle;
+    searchFilters[key] = !searchFilters[key];
+    applySearchNow();
+  });
+}
+for (const [id, key] of [
+  ['f-min-likes', 'minLikes'],
+  ['f-max-likes', 'maxLikes'],
+  ['f-min-replies', 'minReplies'],
+  ['f-max-replies', 'maxReplies'],
+  ['f-author', 'author'],
+]) {
+  byId(id).addEventListener('input', (event) => {
+    searchFilters[key] = event.target.value;
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => applySearchNow(), 120);
+  });
+}
+byId('cancel-embed').addEventListener('click', () => cancelSemanticIndexing({ silent: false }));
+byId('clear-indexed-comments').addEventListener('click', clearIndexedComments);
+byId('clear-downloaded-models').addEventListener('click', clearDownloadedModels);
 byId('collect').addEventListener('click', () => collect());
 byId('clear-chat').addEventListener('click', () => { approvedScopes.clear(); clearChat(); });
 byId('load-saved-export').addEventListener('click', loadSavedExport);
@@ -1804,6 +2661,7 @@ dialog.addEventListener('close', () => {
   byId('font-scale-value').textContent = settings.fontScale + '%';
   viewer.setScale(settings.fontScale);
   resizeAskInput();
+  resizeSearchInput();
   // Never leave a revealed key in the DOM after the dialog closes.
   clearLlmKeyReveal();
   byId('llm-key').value = '';
@@ -1812,6 +2670,7 @@ config.elements.namedItem('fontScale').addEventListener('input', (event) => {
   byId('font-scale-value').textContent = event.target.value + '%';
   viewer.setScale(Number(event.target.value));
   resizeAskInput();
+  resizeSearchInput();
 });
 config.elements.namedItem('stackComments').addEventListener('change', (event) => { config.elements.namedItem('stackWindow').disabled = !event.target.checked; });
 config.addEventListener('submit', (event) => {
@@ -1824,13 +2683,21 @@ config.addEventListener('submit', (event) => {
 });
 
 // Settings tabs
-for (const tab of [byId('settings-tab-general'), byId('settings-tab-llm')]) {
-  tab.addEventListener('click', () => setSettingsTab(tab.id === 'settings-tab-llm' ? 'llm' : 'general'));
+const settingsTabs = [byId('settings-tab-general'), byId('settings-tab-search'), byId('settings-tab-llm')];
+const tabNameOf = (el) => el.id === 'settings-tab-llm' ? 'llm' : el.id === 'settings-tab-search' ? 'search' : 'general';
+for (const tab of settingsTabs) {
+  tab.addEventListener('click', () => setSettingsTab(tabNameOf(tab)));
   tab.addEventListener('keydown', (event) => {
-    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+    const idx = settingsTabs.indexOf(tab);
+    let nextIdx = -1;
+    if (event.key === 'ArrowRight') nextIdx = (idx + 1) % settingsTabs.length;
+    else if (event.key === 'ArrowLeft') nextIdx = (idx - 1 + settingsTabs.length) % settingsTabs.length;
+    else if (event.key === 'Home') nextIdx = 0;
+    else if (event.key === 'End') nextIdx = settingsTabs.length - 1;
+    if (nextIdx < 0) return;
     event.preventDefault();
-    const next = tab.id === 'settings-tab-general' ? byId('settings-tab-llm') : byId('settings-tab-general');
-    setSettingsTab(next.id === 'settings-tab-llm' ? 'llm' : 'general');
+    const next = settingsTabs[nextIdx];
+    setSettingsTab(tabNameOf(next));
     next.focus();
   });
 }
@@ -1948,10 +2815,19 @@ byId('import-file').addEventListener('change', (event) => {
   event.target.value = '';
 });
 query.addEventListener('input', () => {
+  resizeSearchInput();
   updateComposer();
   if (mode !== 'search') return;
+  hideRegexErrorTip();
+  searchSortPinned = false;
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(() => viewer.setQuery(query.value), 100);
+  searchTimer = setTimeout(() => applySearchNow(), 110);
+});
+query.addEventListener('keydown', (event) => {
+  if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
+    event.preventDefault();
+    applySearchNow({ immediateRegexHint: true });
+  }
 });
 askInput.addEventListener('input', () => {
   resizeAskInput();
@@ -1971,7 +2847,7 @@ askInput.addEventListener('keydown', (event) => {
 byId('composer').addEventListener('submit', (event) => {
   event.preventDefault();
   if (mode === 'ai') ask(askInput.value.trim());
-  else viewer.setQuery(query.value);
+  else applySearchNow({ immediateRegexHint: true });
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
@@ -1980,6 +2856,10 @@ chrome.storage.onChanged.addListener((changes, area) => {
     settings = changes.settings.newValue;
     viewer.setSettings(settings);
   }
+  if (changes.searchPresets?.newValue) {
+    savedPresets = changes.searchPresets.newValue;
+    renderSavedPresets();
+  }
   if (changes.llmConfig?.newValue) loadLlmConfig();
 });
 chrome.tabs.onUpdated.addListener((id, change) => { if (id === tabId && change.status === 'complete') connect(); });
@@ -1987,6 +2867,8 @@ chrome.tabs.onRemoved.addListener((id) => { if (id === tabId) window.close(); })
 window.addEventListener('pagehide', () => {
   closing = true;
   stopCountPolling();
+  hideRegexErrorTip();
+  killSearchWorker();
   clearLlmKeyReveal();
   byId('llm-key').value = '';
   stopAsking();
@@ -1999,7 +2881,13 @@ resetView(null);
 if (tabId > 0) {
   connect();
   connectModel();
-  worker('settings').then((value) => { settings = value.settings; viewer.setSettings(settings); }).catch((error) => notice(error.message));
+  worker('settings').then((value) => {
+    settings = value.settings;
+    searchMode = settings.defaultSearchMode === 'exact' ? 'exact' : 'fuzzy';
+    viewer.setSettings(settings);
+    updateSearchUi();
+  }).catch((error) => notice(error.message));
+  loadSearchPresets();
   loadLlmConfig();
 } else {
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });

@@ -70,6 +70,9 @@ export function normalizeEntry(key, input) {
       avatar: mediaUrl(comment.avatar), published: text(comment.published, 512),
       likes: Number.isFinite(comment.likes) ? String(comment.likes) : text(comment.likes, 64),
       replyCount: Number.isFinite(comment.replyCount) ? String(comment.replyCount) : text(comment.replyCount, 64),
+      ...(comment.hearted === true ? { hearted: true } : {}),
+      ...(comment.isCreator === true ? { isCreator: true } : {}),
+      ...(comment.edited === true || /\(edited\)/i.test(text(comment.published, 512)) ? { edited: true } : {}),
     };
   });
   const result = {

@@ -8,6 +8,7 @@ globalThis.YTCT = (() => {
     format: 'markdown', shareTranscript: false, autoCollect: false, contextWindow: 32768, debugOllama: false, cacheEnabled: false,
     cacheDays: 7, cacheMB: 100, unusedCacheHours: 24, highlightBefore: 3, highlightAfter: 3, replyBatch: 10,
     fontScale: 100, stackComments: true, stackWindow: 3, linkTheater: false,
+    defaultSearchMode: 'fuzzy', semanticSearchEnabled: false, semanticModel: 'arctic-xs', semanticDevice: 'auto',
   });
 
   function sourceKey(url) {

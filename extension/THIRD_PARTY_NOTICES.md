@@ -36,3 +36,14 @@ Markdown rendering in the Ask panel uses a bundled copy of **markdown-it**
 - Project: https://github.com/markdown-it/markdown-it
 - Copyright: Vitaly Puzrin, Alex Kocharin
 - License: MIT License ([licenses/LICENSE-markdown-it.txt](licenses/LICENSE-markdown-it.txt))
+
+## Transformers.js & ONNX Runtime Web
+
+Opt-in local semantic search uses the standalone browser bundle of
+**@huggingface/transformers** (v4.3.2, `vendor/transformers/transformers.min.js`),
+which bundles the ONNX Runtime Web JS glue:
+
+- Project: https://github.com/huggingface/transformers.js
+- Copyright: Hugging Face Inc. and contributors
+- License: Apache License, Version 2.0 ([licenses/LICENSE-transformers.txt](licenses/LICENSE-transformers.txt))
+- ONNX Runtime Web: https://github.com/microsoft/onnxruntime (Copyright Microsoft Corporation, MIT License; WASM runtime fetched on opt-in from jsDelivr and cached locally in browser storage).
