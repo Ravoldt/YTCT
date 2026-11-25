@@ -118,7 +118,7 @@ export async function readChatStream(response, update, signal) {
     if (data.message?.thinking) thinking = true;
     if (typeof data.message?.content === 'string') {
       content += data.message.content;
-      if (content.length > 262144) throw new Error('The local model answer exceeded the display limit.');
+      if (content.length > 1048576) throw new Error('The local model answer exceeded the display limit.');
     }
     if (data.done === true) metrics = data;
   }
@@ -173,7 +173,7 @@ export async function askOllama(session, history, question, settings, onChange, 
         truncate: false,
         shift: false,
         ...(retryWithoutThinking ? { think: false } : think !== undefined ? { think } : {}),
-        options: { num_ctx: session.contextWindow, num_predict: YTCT.outputTokenBudget(session.contextWindow) },
+        options: { num_ctx: session.contextWindow, num_predict: -1 },
       }, requestSignal);
       result = await readChatStream(response, (update) => {
         if (update.content.trim()) visible = true;

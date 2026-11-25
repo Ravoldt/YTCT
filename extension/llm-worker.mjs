@@ -1,10 +1,12 @@
 // Connection flow and provider metadata adapted from Cline (Apache-2.0).
 // See licenses/LICENSE-CLINE.txt and THIRD_PARTY_NOTICES.md for attribution and changes.
 import {
-  activeProfile, canonicalEndpoint, chatEndpoint, maskKey, modelsEndpoint, normalizeLlmConfig,
-  normalizeProfile, originPattern, profileDestination, providerHeaders, providerKeyRequired, providerOrigin,
-  providerSpecFor, reasoningEffort, resolveModelCapabilities,
+  activeProfile, canonicalEndpoint, chatEndpoint, effectiveContextWindow, knownModelCapabilities,
+  maskKey, modelsEndpoint, normalizeLlmConfig, normalizeProfile, originPattern, profileDestination,
+  providerHeaders, providerKeyRequired, providerOrigin, providerSpecFor, reasoningEffort,
+  resolveModelCapabilities,
 } from './llm-config.mjs';
+import { mergeOpenRouterPricing } from './pricing.mjs';
 import { relayOffscreen } from './offscreen-worker.mjs';
 import { relayLoopback } from './loopback-worker.mjs';
 import { showModel } from './ollama.mjs';
@@ -284,6 +286,22 @@ function extractContextLength(row) {
   return 0;
 }
 
+function extractMaxOutputTokens(row) {
+  if (!row || typeof row !== 'object') return 0;
+  const candidates = [
+    row.max_output_tokens,
+    row.max_completion_tokens,
+    row.output_token_limit,
+    row.outputTokenLimit,
+    row.top_provider?.max_completion_tokens,
+  ];
+  for (const raw of candidates) {
+    const value = Math.floor(Number(raw));
+    if (Number.isFinite(value) && value >= 256) return value;
+  }
+  return 0;
+}
+
 function extractThinkingMeta(row) {
   if (!row || typeof row !== 'object') return null;
   if (row.capabilities && typeof row.capabilities === 'object' && !Array.isArray(row.capabilities)) {
@@ -338,7 +356,11 @@ export function parseModelCatalog(provider, data) {
     const id = typeof row === 'string' ? row.trim() : String(row?.id || row?.name || row?.model || '').trim();
     if (!id) continue;
     const apiMeta = typeof row === 'object' && row
-      ? { contextLength: extractContextLength(row), thinking: extractThinkingMeta(row) }
+      ? {
+        contextLength: extractContextLength(row),
+        maxOutputTokens: extractMaxOutputTokens(row),
+        thinking: extractThinkingMeta(row),
+      }
       : null;
     if (!byId.has(id)) byId.set(id, resolveModelCapabilities(provider, id, apiMeta));
   }
@@ -348,7 +370,13 @@ export function parseModelCatalog(provider, data) {
   return { models, modelMeta };
 }
 
-async function requestChat(profile, key, messages, thinking, signal) {
+function approxPromptTokens(messages) {
+  let chars = 0;
+  for (const m of messages || []) chars += String(m?.content || '').length + 24;
+  return Math.ceil(chars / 3.5);
+}
+
+async function requestChat(profile, key, messages, thinking, signal, options = {}) {
   if (providerKeyRequired(profile) && !key) {
     throw new Error('Add an API key for ' + profile.label + ' in Settings → LLM.');
   }
@@ -356,10 +384,41 @@ async function requestChat(profile, key, messages, thinking, signal) {
   if (!endpoint) throw new Error('Enter a valid base URL in Settings → LLM.');
   const spec = providerSpecFor(profile);
   const body = { model: profile.model, messages, stream: true };
-  body.max_tokens = 4096;
+
+  // Never artificially cap output at 4096: use the model's true max output tokens
+  // (clamped to remaining context headroom), or omit to let the provider use its full max.
+  const maxOut = Math.floor(Number(
+    options.maxOutputTokens || profile.maxOutputTokens
+    || knownModelCapabilities(profile.provider, profile.model).maxOutputTokens || 0,
+  )) || 0;
+  const ctxLimit = Math.floor(Number(options.contextWindow || effectiveContextWindow(profile))) || 0;
+  if (maxOut > 0) {
+    const headroom = ctxLimit > 0 ? Math.max(2048, ctxLimit - approxPromptTokens(messages) - 512) : maxOut;
+    body.max_tokens = Math.min(maxOut, headroom);
+  } else if (profile.provider === 'anthropic') {
+    body.max_tokens = 8192;
+  }
+
   if (!spec.local) body.stream_options = { include_usage: true };
   const effort = profile.thinkingCapabilities?.supported === false ? '' : reasoningEffort(thinking || profile.thinking);
   if (effort) body.reasoning_effort = effort;
+
+  // Per-provider web search / built-in tool permission controls.
+  const allowWebSearch = typeof options.allowWebSearch === 'boolean' ? options.allowWebSearch : !!profile.allowWebSearch;
+  if (profile.provider === 'perplexity') {
+    if (!allowWebSearch) body.disable_search = true;
+  } else if (profile.provider === 'openrouter') {
+    if (allowWebSearch) body.plugins = [{ id: 'web' }];
+  } else if (profile.provider === 'xai') {
+    body.search_parameters = { mode: allowWebSearch ? 'auto' : 'off' };
+  } else if (profile.provider === 'gemini') {
+    if (allowWebSearch) body.tools = [{ google_search: {} }];
+  } else if (profile.provider === 'openai') {
+    if (allowWebSearch && /search/i.test(profile.model)) body.web_search_options = {};
+  } else if (profile.provider === 'zai') {
+    if (allowWebSearch) body.tools = [{ type: 'web_search', web_search: { enable: true } }];
+  }
+
   const headers = {
     Accept: 'text/event-stream',
     'Content-Type': 'application/json',
@@ -386,9 +445,24 @@ async function requestChat(profile, key, messages, thinking, signal) {
     delete body.reasoning_effort;
     result = await send();
   }
-  if (result.status === 400 && /max_completion_tokens|unsupported.{0,60}max_tokens/i.test(result.raw)) {
+  if (result.status === 400 && (body.plugins || body.search_parameters || body.disable_search || body.web_search_options || body.tools)
+    && /plugin|search_parameters|disable_search|web_search|google_search|tools|unknown field|unrecognized|not supported/i.test(result.raw)) {
+    delete body.plugins;
+    delete body.search_parameters;
+    delete body.disable_search;
+    delete body.web_search_options;
+    delete body.tools;
+    result = await send();
+  }
+  if (result.status === 400 && body.max_tokens && /max_completion_tokens|unsupported.{0,60}max_tokens/i.test(result.raw)) {
     body.max_completion_tokens = body.max_tokens;
     delete body.max_tokens;
+    result = await send();
+  }
+  if (result.status === 400 && (body.max_tokens || body.max_completion_tokens)
+    && /max_tokens|max_completion_tokens|maximum context|exceed|too large|must be less|range/i.test(result.raw)) {
+    delete body.max_tokens;
+    delete body.max_completion_tokens;
     result = await send();
   }
   if (result.response) return result.response;
@@ -416,6 +490,9 @@ async function fetchProviderModels(profile, key, signal) {
     throw providerError(response.status, raw, profile, endpoint, key);
   }
   const data = await boundedResponse(response).json();
+  if (profile.provider === 'openrouter' && Array.isArray(data?.data)) {
+    mergeOpenRouterPricing(data.data).catch(() => {});
+  }
   const { models, modelMeta } = parseModelCatalog(profile.provider, data);
   return { models, modelMeta, endpoint, latency: Date.now() - started };
 }
@@ -510,6 +587,7 @@ export async function getLlmModelInfo(message = {}) {
         const data = await boundedResponse(res, 256 * 1024).json();
         apiMeta = {
           contextLength: extractContextLength(data),
+          maxOutputTokens: extractMaxOutputTokens(data),
           thinking: typeof data?.thinking === 'boolean'
             ? (data.thinking ? { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] } : { supported: false, levels: ['default'] })
             : null,
@@ -606,27 +684,147 @@ export async function testLlmConnection(message = {}) {
 }
 
 
+function mergePlainObject(target, source) {
+  if (!source || typeof source !== 'object' || Array.isArray(source)) return target;
+  const out = target ? { ...target } : {};
+  for (const [k, v] of Object.entries(source)) {
+    if (v === undefined || v === null) continue;
+    if (typeof v === 'object' && !Array.isArray(v)) {
+      out[k] = mergePlainObject(out[k], v);
+    } else {
+      out[k] = v;
+    }
+  }
+  return out;
+}
+
 function makeStreamReader() {
   let content = '';
   let thought = false;
   let usage = null;
+  let rawUsage = null;
+  let rawTimings = null;
+  let model = '';
+  let serviceTier = '';
   let finish = '';
   let done = false;
+  const toolQueries = [];
+  const toolSources = [];
+  const toolNames = [];
+  let webSearchUsed = false;
+
+  function collectToolsFrom(data, choice, delta) {
+    if (Array.isArray(data?.citations)) {
+      for (const c of data.citations) {
+        if (typeof c === 'string') toolSources.push({ url: c, title: '' });
+        else if (c && typeof c === 'object') toolSources.push({ url: c.url || c.uri, title: c.title || '' });
+      }
+      if (data.citations.length) { webSearchUsed = true; toolNames.push('web_search'); }
+    }
+    if (Array.isArray(data?.search_results)) {
+      for (const s of data.search_results) {
+        if (s && typeof s === 'object') toolSources.push({ url: s.url || s.link, title: s.title || '' });
+      }
+      if (data.search_results.length) { webSearchUsed = true; toolNames.push('web_search'); }
+    }
+    if (Array.isArray(data?.web_search)) {
+      for (const s of data.web_search) {
+        if (s && typeof s === 'object') toolSources.push({ url: s.link || s.url, title: s.title || '' });
+      }
+      if (data.web_search.length) { webSearchUsed = true; toolNames.push('web_search'); }
+    }
+    for (const gm of [data?.groundingMetadata, data?.grounding_metadata, choice?.grounding_metadata, choice?.message?.grounding_metadata]) {
+      if (!gm || typeof gm !== 'object') continue;
+      if (Array.isArray(gm.webSearchQueries)) {
+        for (const q of gm.webSearchQueries) if (typeof q === 'string') toolQueries.push(q);
+      }
+      if (Array.isArray(gm.web_search_queries)) {
+        for (const q of gm.web_search_queries) if (typeof q === 'string') toolQueries.push(q);
+      }
+      const chunks = gm.groundingChunks || gm.grounding_chunks;
+      if (Array.isArray(chunks)) {
+        for (const ch of chunks) {
+          const web = ch?.web || ch;
+          if (web?.uri || web?.url) toolSources.push({ url: web.uri || web.url, title: web.title || '' });
+        }
+      }
+      if (toolQueries.length || toolSources.length) { webSearchUsed = true; toolNames.push('google_search'); }
+    }
+    for (const annList of [delta?.annotations, choice?.message?.annotations, data?.annotations]) {
+      if (!Array.isArray(annList)) continue;
+      for (const ann of annList) {
+        const cite = ann?.url_citation || ann;
+        if (cite?.url) {
+          toolSources.push({ url: cite.url, title: cite.title || '' });
+          webSearchUsed = true;
+          toolNames.push('web_search');
+        }
+      }
+    }
+    for (const calls of [delta?.tool_calls, choice?.message?.tool_calls]) {
+      if (!Array.isArray(calls)) continue;
+      for (const call of calls) {
+        const name = call?.function?.name || call?.name || call?.type;
+        if (typeof name === 'string' && name.trim()) {
+          toolNames.push(name.trim());
+          if (/search|web|browse/i.test(name)) webSearchUsed = true;
+        }
+      }
+    }
+    for (const execList of [delta?.executed_tools, choice?.message?.executed_tools, data?.executed_tools]) {
+      if (!Array.isArray(execList)) continue;
+      for (const tool of execList) {
+        const name = tool?.type || tool?.name;
+        if (typeof name === 'string' && name.trim()) {
+          toolNames.push(name.trim());
+          if (/search|web|browse/i.test(name)) webSearchUsed = true;
+        }
+        if (typeof tool?.arguments === 'string') {
+          try {
+            const parsed = JSON.parse(tool.arguments);
+            if (typeof parsed?.query === 'string') toolQueries.push(parsed.query);
+          } catch {}
+        }
+        if (Array.isArray(tool?.search_results?.results)) {
+          for (const r of tool.search_results.results) {
+            if (r?.url) toolSources.push({ url: r.url, title: r.title || '' });
+          }
+        }
+      }
+    }
+  }
+
   function apply(data) {
     if (!data || typeof data !== 'object') return;
     if (data.error) {
       const error = data.error;
       throw new Error(typeof error === 'string' ? error : (error.message || 'The provider returned an error.'));
     }
-    if (data.usage) usage = usageFor(data.usage) || usage;
+    if (typeof data.model === 'string' && data.model.trim()) model = data.model.trim();
+    if (typeof data.service_tier === 'string' && data.service_tier.trim()) serviceTier = data.service_tier.trim();
+    if (data.usage && typeof data.usage === 'object') {
+      usage = usageFor(data.usage) || usage;
+      rawUsage = mergePlainObject(rawUsage, data.usage);
+    }
+    if (data.x_groq?.usage && typeof data.x_groq.usage === 'object') {
+      usage = usageFor(data.x_groq.usage) || usage;
+      rawUsage = mergePlainObject(rawUsage, data.x_groq.usage);
+    }
+    if (data.timings && typeof data.timings === 'object') {
+      rawTimings = mergePlainObject(rawTimings, data.timings);
+    }
+    if (data.stats && typeof data.stats === 'object') {
+      rawTimings = mergePlainObject(rawTimings, data.stats);
+    }
     const choice = Array.isArray(data.choices) ? data.choices[0] : null;
+    const delta = choice ? (choice.delta || choice.message || {}) : null;
+    collectToolsFrom(data, choice, delta);
     if (choice) {
-      const delta = choice.delta || choice.message || {};
       const next = extractText(delta.content ?? choice.text);
       const reasoning = extractText(delta.reasoning_content) || extractText(delta.reasoning) || extractText(delta.thinking);
       if (next) {
         content += next;
-        if (content.length > 262144) throw new Error('The provider answer exceeded the display limit.');
+        if (content.length > 1048576) throw new Error('The provider answer exceeded the display limit.');
       }
       if (reasoning) thought = true;
       if (choice.finish_reason) finish = String(choice.finish_reason);
@@ -652,6 +850,11 @@ function makeStreamReader() {
     get content() { return content; },
     get thinking() { return thought; },
     get usage() { return usage; },
+    get rawUsage() { return rawUsage; },
+    get rawTimings() { return rawTimings; },
+    get model() { return model; },
+    get serviceTier() { return serviceTier; },
+    get toolsInfo() { return { webSearchUsed, queries: toolQueries, sources: toolSources, tools: toolNames }; },
     get finish() { return finish; },
     get done() { return done; },
   };
@@ -701,10 +904,12 @@ async function readStream(response, signal, onUpdate) {
   return reader;
 }
 
-export async function performLlmChat({ profile, key, messages, thinking }, send) {
+export async function performLlmChat({ profile, key, messages, thinking, allowWebSearch, maxOutputTokens, contextWindow }, send) {
   const signal = AbortSignal.timeout(15 * 60000);
   try {
-    const response = await requestChat(profile, key, messages, thinking, signal);
+    const response = await requestChat(profile, key, messages, thinking, signal, {
+      allowWebSearch, maxOutputTokens, contextWindow,
+    });
     let last = 0;
     const reader = await readStream(response, signal, (state) => {
       if ((!state.content && !state.thinking) || Date.now() - last < 100) return;
@@ -716,7 +921,18 @@ export async function performLlmChat({ profile, key, messages, thinking }, send)
     if (!reader.content.trim() && !reader.thinking) {
       throw new Error('The model returned no answer text. Check the model name and try again.');
     }
-    send({ type: 'done', content: reader.content, thinking: reader.thinking, usage: reader.usage, finish: reader.finish });
+    send({
+      type: 'done',
+      content: reader.content,
+      thinking: reader.thinking,
+      usage: reader.usage,
+      rawUsage: reader.rawUsage,
+      rawTimings: reader.rawTimings,
+      model: reader.model,
+      serviceTier: reader.serviceTier,
+      toolsInfo: reader.toolsInfo,
+      finish: reader.finish,
+    });
   } catch (error) {
     throw new Error(scrubKey(error.message, key));
   }
@@ -751,7 +967,15 @@ export function connectLlmChat(port) {
       }
       await ensureHostAccess(profile);
       if (!connected) return;
-      cancel = relayOffscreen('provider-chat', { profile, key, messages: message.messages, thinking: message.thinking }, send);
+      cancel = relayOffscreen('provider-chat', {
+        profile,
+        key,
+        messages: message.messages,
+        thinking: message.thinking,
+        allowWebSearch: profile.allowWebSearch === true,
+        maxOutputTokens: Number(message.maxOutputTokens) || profile.maxOutputTokens || 0,
+        contextWindow: Number(message.contextWindow) || 0,
+      }, send);
     })().catch((error) => {
       send({ type: 'error', error: error.message || String(error), code: error.code });
     });

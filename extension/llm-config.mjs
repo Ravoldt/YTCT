@@ -19,6 +19,7 @@ const preset = (id, label, options = {}) => {
     local: false,
     custom: false,
     native: false,
+    webSearchCapable: false,
     auth: 'bearer',
     headers: {},
     signupUrl: '',
@@ -35,6 +36,7 @@ export const PROVIDERS = Object.freeze({
     defaultEndpoint: 'https://api.openai.com/v1',
     defaultModel: 'gpt-4o-mini',
     models: ['gpt-4o-mini', 'gpt-4o', 'gpt-4.1-mini', 'gpt-4.1', 'o4-mini', 'o3-mini'],
+    webSearchCapable: true,
     signupUrl: 'https://platform.openai.com/api-keys',
     docsUrl: 'https://platform.openai.com/docs/models',
     help: 'Uses OpenAI’s chat completions API. Models are loaded from the account.',
@@ -52,6 +54,7 @@ export const PROVIDERS = Object.freeze({
     defaultEndpoint: 'https://generativelanguage.googleapis.com/v1beta/openai',
     defaultModel: 'gemini-2.5-flash',
     models: ['gemini-2.5-flash', 'gemini-2.5-pro', 'gemini-2.0-flash'],
+    webSearchCapable: true,
     signupUrl: 'https://aistudio.google.com/apikey',
     docsUrl: 'https://ai.google.dev/gemini-api/docs/openai',
     help: 'Uses Gemini’s OpenAI-compatible endpoint.',
@@ -63,6 +66,7 @@ export const PROVIDERS = Object.freeze({
       'openai/gpt-4o-mini', 'openai/gpt-4o', 'anthropic/claude-sonnet-4.5',
       'google/gemini-2.5-flash', 'deepseek/deepseek-chat',
     ],
+    webSearchCapable: true,
     signupUrl: 'https://openrouter.ai/settings/keys',
     docsUrl: 'https://openrouter.ai/models',
     help: 'The model list is public, so it can be loaded before entering a key.',
@@ -93,6 +97,7 @@ export const PROVIDERS = Object.freeze({
     defaultEndpoint: 'https://api.x.ai/v1',
     defaultModel: 'grok-3',
     models: ['grok-3', 'grok-3-mini', 'grok-4'],
+    webSearchCapable: true,
     signupUrl: 'https://console.x.ai/',
     docsUrl: 'https://docs.x.ai/docs/models',
   }),
@@ -143,6 +148,7 @@ export const PROVIDERS = Object.freeze({
     models: ['sonar', 'sonar-pro', 'sonar-reasoning'],
     chatPath: '/chat/completions',
     modelsPath: '/models',
+    webSearchCapable: true,
     signupUrl: 'https://www.perplexity.ai/settings/api',
     docsUrl: 'https://docs.perplexity.ai/',
   }),
@@ -157,6 +163,7 @@ export const PROVIDERS = Object.freeze({
     defaultEndpoint: 'https://api.z.ai/api/paas/v4',
     defaultModel: 'glm-4.5',
     models: ['glm-4.5', 'glm-4.5-air', 'glm-4-plus'],
+    webSearchCapable: true,
     signupUrl: 'https://z.ai/manage-apikey/apikey-list',
     docsUrl: 'https://docs.z.ai/guides/overview/pricing',
   }),
@@ -262,92 +269,120 @@ export function knownModelCapabilities(provider, modelId) {
   const id = String(modelId || '').toLowerCase();
   const leaf = id.split('/').pop().split(':')[0];
   let contextLength = 0;
+  let maxOutputTokens = 0;
   let thinking = { supported: null, levels: ['default', 'off', 'low', 'medium', 'high'] };
   if (/^gpt-5/.test(leaf)) {
     contextLength = 400000;
+    maxOutputTokens = 128000;
     thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
   } else if (/^gpt-4\.1/.test(leaf)) {
     contextLength = 1047576;
+    maxOutputTokens = 32768;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^gpt-4o/.test(leaf)) {
     contextLength = 128000;
+    maxOutputTokens = 16384;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^o[134](?:-|$)/.test(leaf)) {
     contextLength = 200000;
+    maxOutputTokens = 100000;
     thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
   } else if (/^claude-(?:opus-4|sonnet-4|haiku-4|3-7-sonnet|3\.7-sonnet)/.test(leaf)) {
     contextLength = 200000;
+    maxOutputTokens = 64000;
     thinking = { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] };
   } else if (/^claude-3-5|^claude-3\.5/.test(leaf)) {
     contextLength = 200000;
+    maxOutputTokens = 8192;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^gemini-2\.5|^gemini-3/.test(leaf)) {
     contextLength = 1048576;
+    maxOutputTokens = 65536;
     thinking = { supported: true, levels: ['default', 'off', 'low', 'medium', 'high'] };
   } else if (/^gemini-2\.0/.test(leaf)) {
     contextLength = 1048576;
+    maxOutputTokens = 8192;
     thinking = { supported: /thinking/.test(leaf), levels: /thinking/.test(leaf) ? ['default', 'off', 'low', 'medium', 'high'] : ['default'] };
   } else if (/^deepseek-reasoner|^deepseek-r1/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 65536;
     thinking = { supported: true, levels: ['default'] };
   } else if (/^deepseek-chat|^deepseek-v3/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 8192;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^grok-4/.test(leaf)) {
     contextLength = 256000;
+    maxOutputTokens = 64000;
     thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
   } else if (/^grok-3-mini/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: true, levels: ['default', 'low', 'high'] };
   } else if (/^grok-3/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^sonar-reasoning/.test(leaf)) {
     contextLength = 128000;
+    maxOutputTokens = 8192;
     thinking = { supported: true, levels: ['default'] };
   } else if (/^sonar/.test(leaf)) {
     contextLength = 128000;
+    maxOutputTokens = 8192;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^mistral-large|^mistral-small|^ministral|^codestral/.test(leaf)) {
     contextLength = /codestral/.test(leaf) ? 256000 : 128000;
+    maxOutputTokens = 32768;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^llama-3\.[123]|^llama3\.[123]|^meta-llama-3\.[123]|^llama-v3p3/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^qwen3|^qwq/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: true, levels: ['default', 'off', 'on'] };
   } else if (/^qwen2\.5/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 8192;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^gpt-oss/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: true, levels: ['default', 'low', 'medium', 'high'] };
   } else if (/^moonshot-v1-8k/.test(leaf)) {
     contextLength = 8192;
+    maxOutputTokens = 8192;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^moonshot-v1-32k/.test(leaf)) {
     contextLength = 32768;
+    maxOutputTokens = 32768;
     thinking = { supported: false, levels: ['default'] };
   } else if (/^kimi-k2/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 32768;
     thinking = { supported: /thinking/.test(leaf), levels: /thinking/.test(leaf) ? ['default', 'off', 'on'] : ['default'] };
   } else if (/^glm-4\.5|^glm-4-plus/.test(leaf)) {
     contextLength = 131072;
+    maxOutputTokens = 65536;
     thinking = { supported: /^glm-4\.5/.test(leaf), levels: /^glm-4\.5/.test(leaf) ? ['default', 'off', 'on'] : ['default'] };
   }
   if (!contextLength && isCloudManagedProvider(provider)) contextLength = 128000;
-  return { contextLength, thinking };
+  return { contextLength, maxOutputTokens, thinking };
 }
 
 export function resolveModelCapabilities(provider, modelId, apiMeta = null) {
   const fallback = knownModelCapabilities(provider, modelId);
   const apiContext = contextInt(apiMeta?.contextLength);
+  const apiOutRaw = Math.floor(Number(apiMeta?.maxOutputTokens));
+  const apiOutput = Number.isFinite(apiOutRaw) && apiOutRaw >= 256 ? Math.min(MAX_CONTEXT_LIMIT, apiOutRaw) : 0;
   const apiThinking = apiMeta?.thinking && typeof apiMeta.thinking.supported === 'boolean'
     ? normalizeThinkingCapabilities(apiMeta.thinking)
     : null;
   return {
     contextLength: apiContext || fallback.contextLength,
+    maxOutputTokens: apiOutput || fallback.maxOutputTokens || 0,
     thinking: apiThinking || normalizeThinkingCapabilities(fallback.thinking),
   };
 }
@@ -404,8 +439,11 @@ export function defaultProfile(provider = 'cloud') {
     thinking: 'default',
     contextWindow: isCloudManagedProvider(provider) ? 0 : DEFAULT_LOCAL_CONTEXT,
     maxContext: caps.contextLength,
+    maxOutputTokens: caps.maxOutputTokens || 0,
     thinkingCapabilities: caps.thinking,
-    pricing: { input: 0, output: 0 },
+    allowWebSearch: false,
+    pricingMode: 'auto',
+    pricing: { input: 0, output: 0, cacheRead: 0, webSearch: 0 },
     hasKey: false,
     keyHint: '',
     lastUsedAt: 0,
@@ -421,14 +459,26 @@ export function normalizeProfile(raw, index = 0) {
   const spec = PROVIDERS[provider];
   const model = text(raw?.model, 160) || spec.defaultModel;
   const cloudManaged = isCloudManagedProvider(provider);
-  const maxContext = contextInt(raw?.maxContext) || knownModelCapabilities(provider, model).contextLength;
+  const known = knownModelCapabilities(provider, model);
+  const maxContext = contextInt(raw?.maxContext) || known.contextLength;
+  const rawMaxOut = Math.floor(Number(raw?.maxOutputTokens));
+  const maxOutputTokens = (Number.isFinite(rawMaxOut) && rawMaxOut >= 256 ? Math.min(MAX_CONTEXT_LIMIT, rawMaxOut) : 0) || known.maxOutputTokens || 0;
   const rawContext = contextInt(raw?.contextWindow);
   const contextWindow = cloudManaged ? 0 : (rawContext ? (maxContext ? Math.min(rawContext, maxContext) : rawContext) : DEFAULT_LOCAL_CONTEXT);
   const thinkingCapabilities = raw?.thinkingCapabilities
     ? normalizeThinkingCapabilities(raw.thinkingCapabilities)
-    : knownModelCapabilities(provider, model).thinking;
+    : known.thinking;
   const thinking = THINKING_LEVELS.includes(raw?.thinking) && thinkingCapabilities.levels.includes(raw.thinking)
     ? raw.thinking : 'default';
+  const pricing = {
+    input: number(raw?.pricing?.input),
+    output: number(raw?.pricing?.output),
+    cacheRead: number(raw?.pricing?.cacheRead),
+    webSearch: number(raw?.pricing?.webSearch),
+  };
+  const pricingMode = raw?.pricingMode === 'custom' ? 'custom'
+    : raw?.pricingMode === 'auto' ? 'auto'
+      : (pricing.input > 0 || pricing.output > 0 || pricing.cacheRead > 0 || pricing.webSearch > 0) ? 'custom' : 'auto';
   return {
     id: safeId(raw?.id) || (globalThis.crypto?.randomUUID?.() || 'llm-' + Date.now() + '-' + index),
     label: text(raw?.label, 60) || spec.label,
@@ -439,8 +489,11 @@ export function normalizeProfile(raw, index = 0) {
     thinking,
     contextWindow,
     maxContext,
+    maxOutputTokens,
     thinkingCapabilities,
-    pricing: { input: number(raw?.pricing?.input), output: number(raw?.pricing?.output) },
+    allowWebSearch: raw?.allowWebSearch === true,
+    pricingMode,
+    pricing,
     hasKey: !!raw?.hasKey,
     keyHint: text(raw?.keyHint, 8),
     lastUsedAt: Number.isFinite(raw?.lastUsedAt) ? raw.lastUsedAt : 0,
@@ -509,6 +562,10 @@ export function canonicalEndpoint(endpoint) {
 
 export function profileDestination(profile) {
   return JSON.stringify([profile.id, profile.provider, canonicalEndpoint(profile.endpoint), profile.model]);
+}
+
+export function modelApprovalKey(profile) {
+  return JSON.stringify([profile.provider, canonicalEndpoint(profile.endpoint), profile.model]);
 }
 
 function trimBase(endpoint) {

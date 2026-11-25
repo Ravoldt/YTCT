@@ -262,12 +262,19 @@ async function loadTransformers(onProgress) {
     const { env } = mod;
     env.allowLocalModels = false;
     env.useBrowserCache = true;
+    // Suppress Transformers.js internal console.error spam (e.g. "Inputs given to model:"
+    // during handled WebGPU -> WASM fallback); real failures are surfaced in the UI banner.
+    env.logLevel = 50;
     // Disable Transformers.js's built-in WASM factory blob cache: inside a Dedicated
     // Web Worker `globalThis.chrome` is undefined, so it would wrap the factory in a
     // `blob:` URL which Chrome MV3 CSP (`script-src 'self' 'wasm-unsafe-eval'`) blocks.
     // Instead, omit `wasmPaths.mjs` (using the factory bundled inside transformers.min.js)
     // and pre-load + cache the `.wasm` binary directly into `transformers-cache`.
     env.useWasmCache = false;
+    if (env.backends?.onnx?.webgpu) {
+      // Avoid Chromium Windows warning (crbug.com/369219127) from powerPreference option.
+      env.backends.onnx.webgpu.powerPreference = undefined;
+    }
     if (env.backends?.onnx?.wasm) {
       env.backends.onnx.wasm.numThreads = 1;
       env.backends.onnx.wasm.proxy = false;
@@ -325,6 +332,10 @@ async function ensurePipeline(modelKey, devicePreference, onProgress) {
     try {
       const adapter = await navigator.gpu.requestAdapter();
       if (adapter) {
+        if (transformersMod?.env?.backends?.onnx?.webgpu) {
+          transformersMod.env.backends.onnx.webgpu.powerPreference = undefined;
+          transformersMod.env.backends.onnx.webgpu.adapter = adapter;
+        }
         pipe = await pipeline('feature-extraction', spec.id, { dtype: 'q8', device: 'webgpu', progress_callback });
         backend = 'WebGPU';
       }

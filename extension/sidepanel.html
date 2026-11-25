@@ -127,14 +127,34 @@
       <span id="ai-status" role="status">Ready</span>
       <button id="clear-chat" class="pill" type="button" title="Clear this conversation">Clear chat</button>
     </div>
-    <div id="ai-cost" class="ai-cost" hidden></div>
-    <div id="telemetry" class="telemetry" hidden></div>
+    <div id="telemetry-strip" class="telemetry-strip" hidden>
+      <div id="telemetry-pinned-grid" class="telemetry-pinned-grid"></div>
+      <div id="telemetry-pinned-sources" class="telemetry-pinned-sources" hidden></div>
+    </div>
     <div id="chat" class="chat" role="log" tabindex="0" aria-label="Chat"></div>
     <div id="confirm" class="confirm" hidden>
       <p id="confirm-description"></p>
-      <button id="confirm-load" class="pill primary" type="button">Load anyway</button>
+      <button id="confirm-load" class="pill primary" type="button">Accept &amp; send</button>
       <button id="cancel-load" class="pill" type="button">Cancel</button>
     </div>
+  </section>
+
+  <section id="telemetry-drawer" class="telemetry-drawer" aria-label="Model telemetry" hidden>
+    <div class="drawer-head">
+      <div class="drawer-title-group">
+        <strong>Telemetry</strong>
+        <span id="drawer-model-tag" class="drawer-model-tag" hidden></span>
+      </div>
+      <div class="drawer-head-actions">
+        <button type="button" id="unpin-telemetry" class="link-btn">Unpin all</button>
+        <button type="button" id="close-telemetry" class="link-btn">Done</button>
+      </div>
+    </div>
+    <div class="drawer-subrow">
+      <span>Show always above chat</span>
+      <button type="button" id="drawer-tools-badge" class="tool-perm-pill" title="Configure web search &amp; tools in Settings → LLM"></button>
+    </div>
+    <div id="telemetry-list" class="telemetry-list"></div>
   </section>
 
   <footer>
@@ -160,6 +180,13 @@
         <button type="button" data-search-mode="fuzzy" aria-pressed="true" title="Typo-tolerant word matching">Fuzzy</button>
         <button type="button" data-search-mode="semantic" aria-pressed="false" title="Local semantic + hybrid search">Semantic</button>
       </div>
+      <button id="telemetry-toggle" class="telemetry-toggle-btn" type="button" aria-expanded="false" aria-controls="telemetry-drawer" title="Inspect &amp; pin model telemetry" hidden>
+        <svg viewBox="0 0 24 24" stroke-width="2" aria-hidden="true">
+          <path d="M22 12h-4l-3 9L9 3l-3 9H2" />
+        </svg>
+        <span class="telemetry-label">Telemetry</span>
+        <span id="telemetry-pin-count" class="filter-count" hidden>0</span>
+      </button>
     </div>
     <form id="composer">
       <div id="search-field" class="search-field">
@@ -186,23 +213,24 @@
   </footer>
 
   <dialog id="settings" aria-labelledby="settings-title">
+    <header class="settings-head">
+      <h2 id="settings-title">Settings</h2>
+      <div class="settings-tabs" role="tablist" aria-label="Settings sections">
+        <button id="settings-tab-general" class="settings-tab" type="button" role="tab" aria-selected="true"
+          aria-controls="settings-general" tabindex="0">General</button>
+        <button id="settings-tab-search" class="settings-tab" type="button" role="tab" aria-selected="false"
+          aria-controls="settings-search" tabindex="-1">Search</button>
+        <button id="settings-tab-llm" class="settings-tab" type="button" role="tab" aria-selected="false"
+          aria-controls="settings-llm" tabindex="-1">LLM</button>
+      </div>
+      <button id="close-settings" type="button" class="icon" aria-label="Close settings">
+        <svg viewBox="0 0 24 24" aria-hidden="true">
+          <path d="m6 6 12 12M18 6 6 18" />
+        </svg>
+      </button>
+    </header>
+    <div class="settings-body">
     <form id="settings-form">
-      <header class="settings-head">
-        <h2 id="settings-title">Settings</h2>
-        <div class="settings-tabs" role="tablist" aria-label="Settings sections">
-          <button id="settings-tab-general" class="settings-tab" type="button" role="tab" aria-selected="true"
-            aria-controls="settings-general" tabindex="0">General</button>
-          <button id="settings-tab-search" class="settings-tab" type="button" role="tab" aria-selected="false"
-            aria-controls="settings-search" tabindex="-1">Search</button>
-          <button id="settings-tab-llm" class="settings-tab" type="button" role="tab" aria-selected="false"
-            aria-controls="settings-llm" tabindex="-1">LLM</button>
-        </div>
-        <button id="close-settings" type="button" class="icon" aria-label="Close settings">
-          <svg viewBox="0 0 24 24" aria-hidden="true">
-            <path d="m6 6 12 12M18 6 6 18" />
-          </svg>
-        </button>
-      </header>
 
       <div id="settings-general" class="settings-panel" role="tabpanel" aria-labelledby="settings-tab-general">
         <fieldset>
@@ -230,7 +258,6 @@
         <fieldset>
           <legend>Assistant</legend>
           <label>Allow Ask to send the video transcript <input name="shareTranscript" type="checkbox"></label>
-          <label>Show model telemetry <input name="debugOllama" type="checkbox"></label>
         </fieldset>
         <fieldset>
           <legend>Exports</legend>
@@ -377,13 +404,35 @@
         <p id="llm-endpoint-hint" class="hint"></p>
       </fieldset>
 
+      <fieldset id="llm-tools-section">
+        <legend>Web search &amp; tools</legend>
+        <label class="inline-check">Allow web search &amp; built-in tools <input id="llm-allow-web-search" type="checkbox"></label>
+        <p id="llm-tools-hint" class="hint" hidden></p>
+      </fieldset>
+
       <fieldset id="llm-pricing" hidden>
-        <legend>Cloud pricing</legend>
-        <label>Input price (USD / 1M tokens) <input id="llm-input-price" type="number" min="0" step="0.0001"
-            inputmode="decimal"></label>
-        <label>Output price (USD / 1M tokens) <input id="llm-output-price" type="number" min="0" step="0.0001"
-            inputmode="decimal"></label>
-        <p class="hint">Only used for the cost estimate shown under Ask. Leave at 0 to skip cost.</p>
+        <legend>Pricing</legend>
+        <label>Pricing source
+          <select id="llm-pricing-mode">
+            <option value="auto">Automatic</option>
+            <option value="custom">Custom</option>
+          </select>
+        </label>
+        <div id="llm-pricing-auto" class="pricing-box">
+          <div class="pricing-head">
+            <span id="llm-pricing-badge" class="pricing-badge">Not synced</span>
+            <button type="button" id="llm-pricing-refresh" class="link-btn">Refresh</button>
+          </div>
+          <div id="llm-pricing-summary" class="rate-summary"></div>
+        </div>
+        <div id="llm-pricing-custom" class="pricing-box" hidden>
+          <div class="pricing-grid">
+            <label>Input ($ / 1M) <input id="llm-input-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+            <label>Output ($ / 1M) <input id="llm-output-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+            <label>Cache hit ($ / 1M) <input id="llm-cache-read-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+            <label>Web search ($ / 1k) <input id="llm-web-search-price" type="number" min="0" step="0.0001" inputmode="decimal"></label>
+          </div>
+        </div>
       </fieldset>
 
       <fieldset>
@@ -391,6 +440,7 @@
         <label>Name <input id="llm-assistant-name" maxlength="32" autocomplete="off" placeholder="LLM"></label>
         <p class="hint">Used by the Ask button and heading. Leave blank to derive it from the model.</p>
       </fieldset>
+    </div>
     </div>
   </dialog>
 

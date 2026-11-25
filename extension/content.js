@@ -603,10 +603,15 @@
         if (panels.size) sendAll({ event: 'panel-close' });
         else worker({ type: 'open-panel' }).catch((error) => { opener.title = error.message; });
       });
-      const icon = document.createElement('span');
-      icon.setAttribute('aria-hidden', 'true');
-      icon.style.cssText = 'display:block;width:24px;height:24px;background:currentColor;mask:url(' +
-        chrome.runtime.getURL('icons/comments.svg') + ') center / contain no-repeat';
+      const icon = svg('svg', {
+        viewBox: '0 0 24 24', width: 24, height: 24, fill: 'none',
+        stroke: 'currentColor', 'stroke-width': 1.5, 'aria-hidden': true,
+      });
+      icon.append(
+        svg('path', { d: 'M13 3H5a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2v4l4-4h6a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2h-4z' }),
+        svg('line', { x1: 7, y1: 8, x2: 15, y2: 8 }),
+        svg('line', { x1: 7, y1: 12, x2: 15, y2: 12 }),
+      );
       opener.append(icon);
       bar.append(downloadButton, opener);
       place.insertBefore(bar, place.firstChild);

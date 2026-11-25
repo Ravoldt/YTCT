@@ -7,6 +7,7 @@ import {
   activateLlmProfile, activeOllamaModel, connectLlmChat, deleteLlmProfile,
   getLlmConfig, getLlmModelInfo, listLlmModels, revealLlmKey, saveLlmProfile, testLlmConnection,
 } from './llm-worker.mjs';
+import { lookupPricingInWorker, PRICING_TTL_MS } from './pricing.mjs';
 
 const { settingsDefaults, sourceKey, isMediaSource } = YTCT;
 const hour = 3600000;
@@ -134,6 +135,33 @@ function normalizeSearchPreset(raw, index = 0) {
       author: String(f.author || '').trim().slice(0, 120),
     },
   };
+}
+
+async function telemetryPinsAction(message) {
+  const stored = (await chrome.storage.local.get('telemetryPins')).telemetryPins;
+  let pins = Array.isArray(stored) ? stored.filter((k) => typeof k === 'string' && k.length > 0 && k.length <= 80).slice(0, 60) : [];
+  if (message.action === 'set' && Array.isArray(message.pins)) {
+    pins = [...new Set(message.pins.filter((k) => typeof k === 'string' && k.length > 0 && k.length <= 80))].slice(0, 60);
+    await chrome.storage.local.set({ telemetryPins: pins });
+  }
+  return pins;
+}
+
+async function llmApprovalsAction(message) {
+  const stored = (await chrome.storage.local.get('approvedLlmDestinations')).approvedLlmDestinations;
+  let list = Array.isArray(stored) ? stored.filter((k) => typeof k === 'string' && k.length > 0 && k.length <= 600).slice(0, 100) : [];
+  if (message.action === 'approve' && typeof message.key === 'string' && message.key.trim()) {
+    const key = message.key.trim().slice(0, 600);
+    if (!list.includes(key)) {
+      list.push(key);
+      list = list.slice(-100);
+      await chrome.storage.local.set({ approvedLlmDestinations: list });
+    }
+  } else if (message.action === 'remove' && typeof message.key === 'string') {
+    list = list.filter((k) => k !== message.key);
+    await chrome.storage.local.set({ approvedLlmDestinations: list });
+  }
+  return list;
 }
 
 async function searchPresetsAction(message) {
@@ -355,6 +383,21 @@ async function handle(message, sender) {
     case 'search-presets':
       if (!panelTab) throw new Error('Open the side panel to manage search presets.');
       return cacheTask(() => searchPresetsAction(message));
+    case 'telemetry-pins':
+      if (!panelTab) throw new Error('Open the side panel to manage telemetry settings.');
+      return cacheTask(() => telemetryPinsAction(message));
+    case 'llm-approvals':
+      if (!panelTab) throw new Error('Open the side panel to manage assistant approvals.');
+      return cacheTask(() => llmApprovalsAction(message));
+    case 'pricing-lookup':
+      if (!panelTab) throw new Error('Open the side panel to check model pricing.');
+      return lookupPricingInWorker({
+        provider: String(message.provider || ''),
+        model: String(message.model || ''),
+        force: message.force === true,
+        maxAgeMs: Number.isFinite(Number(message.maxAgeMs)) && Number(message.maxAgeMs) >= 0
+          ? Number(message.maxAgeMs) : PRICING_TTL_MS,
+      });
     case 'download-cache':
     case 'download-export': {
       if (!contentTab) throw new Error('Use the download button on YouTube to save a file.');
@@ -463,9 +506,10 @@ function sanitizeOllamaPayload(payload, leasedModel) {
     result.think = payload.think;
   }
   if (payload.options && typeof payload.options === 'object') {
+    const rawPredict = Number(payload.options.num_predict);
     result.options = {
       num_ctx: bounded(payload.options.num_ctx, 32768, 1024, 2097152),
-      num_predict: bounded(payload.options.num_predict, 4096, 1, 8192),
+      num_predict: rawPredict === -1 ? -1 : bounded(rawPredict, -1, 1, 2097152),
     };
   }
   return new Blob([JSON.stringify(result)]).size <= 18 * 1024 * 1024 ? result : null;

@@ -11,9 +11,13 @@ import {
 import {
   PROVIDER_GROUPS, PROVIDERS, activeProfile, assistantLabel, defaultLlmConfig, defaultProfile,
   canonicalEndpoint, contextSteps, effectiveContextWindow, endpointUrl, formatContextLabel,
-  isCloudManagedProvider, isLoopback, maskKey, originPattern, profileDestination, providerOrigin,
-  providerSpec, resolveModelCapabilities,
+  isCloudManagedProvider, isLoopback, maskKey, modelApprovalKey, originPattern, profileDestination,
+  providerOrigin, providerSpec, resolveModelCapabilities,
 } from './llm-config.mjs';
+import {
+  PRICING_TTL_MS, formatRatePerMillion, formatRatePerThousand, formatRefreshAge,
+} from './pricing.mjs';
+import { buildTelemetryReport } from './telemetry.mjs';
 
 const byId = (id) => document.getElementById(id);
 const tabId = Number(new URLSearchParams(location.search).get('tab'));
@@ -22,6 +26,8 @@ const searchField = byId('search-field');
 const regexToggleBtn = byId('regex-toggle');
 const filterToggleBtn = byId('filter-toggle');
 const filterDrawer = byId('filter-drawer');
+const telemetryToggleBtn = byId('telemetry-toggle');
+const telemetryDrawer = byId('telemetry-drawer');
 const searchStrengthEl = byId('search-strength');
 const askField = byId('ask-field');
 const askInput = byId('ask-input');
@@ -86,6 +92,11 @@ let llmCurrentCaps = resolveModelCapabilities('cloud', '');
 let llmCapSeq = 0;
 let llmLocalFetchSeq = 0;
 let llmModelDebounce = null;
+let llmPricingSeq = 0;
+let llmPricingInfo = null;
+let telemetryDrawerOpen = false;
+let telemetryPins = new Set();
+let lastTelemetry = { model: '', items: [] };
 let newCommentsCount = 0;
 let countPollTimer = null;
 let countCheckInFlight = false;
@@ -93,7 +104,7 @@ let settingsTab = 'general';
 let history = [];
 let historyDestination = '';
 let historyHasTranscript = false;
-const approvedScopes = new Set();
+const approvedModels = new Set();
 let closing = false;
 let reconnect;
 
@@ -108,7 +119,7 @@ function setLlmConfig(next) {
   llm = next;
   if (destinationOf(activeLlm()) === before) return;
   if (job || history.length || leaseRequested) clearChat();
-  approvedScopes.clear();
+  clearTelemetry();
 }
 
 const viewer = new CommentsView({
@@ -199,7 +210,6 @@ function stopAsking() {
   job?.controller.abort(new Error('Question stopped.'));
   job = null;
   byId('confirm').hidden = true;
-  clearCost();
   return release();
 }
 
@@ -209,6 +219,7 @@ function clearChat() {
   historyDestination = '';
   historyHasTranscript = false;
   chat.replaceChildren();
+  clearTelemetry();
   byId('ai-status').textContent = activeLlm() ? 'Ready' : 'Configure an LLM in Settings → LLM';
   chrome.storage.session.remove('chat:' + tabId).catch(() => { });
   updateComposer();
@@ -923,6 +934,9 @@ function setMode(next) {
   filterToggleBtn.hidden = ai;
   searchStrengthEl.hidden = ai;
   filterDrawer.hidden = ai || !filterDrawerOpen;
+  telemetryToggleBtn.hidden = !ai;
+  if (!ai) telemetryDrawerOpen = false;
+  telemetryDrawer.hidden = !ai || !telemetryDrawerOpen;
   askField.hidden = !ai;
   byId('send').hidden = !ai;
   byId('search-mode').setAttribute('aria-pressed', String(!ai));
@@ -932,6 +946,7 @@ function setMode(next) {
   if (ai) {
     viewer.setSearchState({ query: '' });
     applyAssistantName();
+    renderTelemetry();
     chat.scrollTop = chat.scrollHeight;
     resizeAskInput();
     requestAnimationFrame(resizeAskInput);
@@ -1026,10 +1041,9 @@ function resetView(info) {
   history = [];
   historyDestination = '';
   historyHasTranscript = false;
-  approvedScopes.clear();
   chat.replaceChildren();
-  byId('telemetry').hidden = true;
-  clearCost();
+  telemetryDrawerOpen = false;
+  clearTelemetry();
   notice('');
   viewer.reset(info?.key || '');
   state = info ? { ...info, entry: null } : null;
@@ -1241,80 +1255,242 @@ function connectModel() {
   });
 }
 
-function updateTelemetry(metrics, requested, model, profile) {
-  const box = byId('telemetry');
-  box.hidden = !settings.debugOllama;
-  if (box.hidden) return;
-  const target = profile || activeLlm();
-  const info = [];
-  if (target) info.push((PROVIDERS[target.provider]?.label || target.provider) + ' · ' + target.model);
-  info.push(requested.toLocaleString() + ' ctx requested');
-  if (target?.provider === 'ollama') {
-    if (model?.context_length) info.push(model.context_length.toLocaleString() + ' ctx loaded');
-    if (Number.isFinite(model?.size_vram)) {
-      const vram = (model.size_vram / 1073741824).toFixed(1);
-      const total = model.size > 0 ? ' of ' + (model.size / 1073741824).toFixed(1) : '';
-      info.push(vram + total + ' GiB in VRAM');
+// ------------------------------------------------------------------ telemetry drawer & pinned strip
+async function loadTelemetryPins() {
+  try {
+    const pins = await worker('telemetry-pins', { action: 'get' });
+    telemetryPins = new Set(Array.isArray(pins) ? pins : []);
+    renderTelemetry();
+  } catch {}
+}
+
+async function saveTelemetryPins() {
+  try {
+    await worker('telemetry-pins', { action: 'set', pins: [...telemetryPins] });
+  } catch {}
+}
+
+async function loadApprovedModels() {
+  try {
+    const list = await worker('llm-approvals', { action: 'list' });
+    approvedModels.clear();
+    if (Array.isArray(list)) for (const key of list) approvedModels.add(key);
+  } catch {}
+}
+
+function clearTelemetry() {
+  lastTelemetry = { model: activeLlm()?.model || '', items: [] };
+  renderTelemetry();
+}
+
+function makeExternalIcon() {
+  const ns = 'http://www.w3.org/2000/svg';
+  const s = document.createElementNS(ns, 'svg');
+  s.setAttribute('viewBox', '0 0 24 24');
+  s.setAttribute('aria-hidden', 'true');
+  const p = document.createElementNS(ns, 'path');
+  p.setAttribute('d', 'M14 5h5v5M19 5l-9 9M10 7H6a1 1 0 0 0-1 1v10a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1v-4');
+  s.append(p);
+  return s;
+}
+
+function renderTelemetry() {
+  const profile = activeLlm();
+  const spec = profile ? providerSpec(profile.provider) : null;
+  const items = Array.isArray(lastTelemetry?.items) ? lastTelemetry.items : [];
+  const modelTag = byId('drawer-model-tag');
+  const tagText = lastTelemetry?.model || profile?.model || '';
+  modelTag.textContent = tagText;
+  modelTag.hidden = !tagText;
+
+  // Tool permission status pill inside Telemetry drawer
+  const permBadge = byId('drawer-tools-badge');
+  if (!profile) {
+    permBadge.textContent = 'No model';
+    permBadge.className = 'tool-perm-pill';
+  } else if (spec?.local) {
+    permBadge.textContent = 'Tools: Offline';
+    permBadge.className = 'tool-perm-pill';
+  } else if (!spec?.webSearchCapable) {
+    permBadge.textContent = 'Search: Unsupported';
+    permBadge.className = 'tool-perm-pill';
+  } else if (profile.allowWebSearch) {
+    permBadge.textContent = 'Web search: Allowed';
+    permBadge.className = 'tool-perm-pill allowed';
+  } else {
+    permBadge.textContent = 'Web search: Blocked';
+    permBadge.className = 'tool-perm-pill';
+  }
+
+  // Telemetry drawer dynamic rows (collected strictly from actual model response)
+  const list = byId('telemetry-list');
+  list.replaceChildren();
+  if (!items.length) {
+    const empty = document.createElement('div');
+    empty.className = 'telemetry-empty';
+    empty.textContent = 'Send a question to inspect metrics reported by this model.';
+    list.append(empty);
+  } else {
+    for (const item of items) {
+      const isPinned = telemetryPins.has(item.key);
+      const wrap = document.createElement('div');
+      wrap.className = 'telemetry-row-wrap';
+
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'telemetry-row';
+      btn.setAttribute('aria-pressed', String(isPinned));
+      btn.title = isPinned ? 'Pinned — click to hide when drawer closes' : 'Show always above chat';
+
+      const sw = document.createElement('span');
+      sw.className = 'pin-switch';
+      sw.setAttribute('aria-hidden', 'true');
+
+      const lbl = document.createElement('span');
+      lbl.className = 'telemetry-row-label';
+      lbl.textContent = item.label;
+
+      const val = document.createElement('span');
+      val.className = 'telemetry-row-value' + (item.tone ? ' ' + item.tone : '');
+      val.textContent = item.value;
+      val.title = item.value;
+
+      btn.append(sw, lbl, val);
+      btn.addEventListener('click', () => {
+        if (telemetryPins.has(item.key)) telemetryPins.delete(item.key);
+        else telemetryPins.add(item.key);
+        renderTelemetry();
+        saveTelemetryPins();
+      });
+      wrap.append(btn);
+
+      if (item.detail || item.queries?.length || item.sources?.length) {
+        const detail = document.createElement('div');
+        detail.className = 'telemetry-detail';
+        if (item.detail) {
+          const line = document.createElement('div');
+          line.textContent = item.detail;
+          detail.append(line);
+        }
+        if (item.queries?.length) {
+          const qRow = document.createElement('div');
+          qRow.className = 'telemetry-query-list';
+          for (const q of item.queries) {
+            const tag = document.createElement('span');
+            tag.className = 'query-tag';
+            tag.textContent = '“' + q + '”';
+            qRow.append(tag);
+          }
+          detail.append(qRow);
+        }
+        if (item.sources?.length) {
+          const sList = document.createElement('div');
+          sList.className = 'source-list';
+          for (const src of item.sources) {
+            const a = document.createElement('a');
+            a.className = 'source-row';
+            a.href = src.url;
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            const t = document.createElement('span');
+            t.className = 'source-row-title';
+            t.textContent = src.title;
+            const h = document.createElement('span');
+            h.className = 'source-row-host';
+            h.textContent = src.host;
+            a.append(t, h);
+            sList.append(a);
+          }
+          detail.append(sList);
+        }
+        wrap.append(detail);
+      }
+      list.append(wrap);
     }
   }
-  if (metrics?.prompt_eval_count) info.push(metrics.prompt_eval_count.toLocaleString() + ' input tokens');
-  if (metrics?.eval_count) info.push(metrics.eval_count.toLocaleString() + ' generated tokens');
-  if (metrics?.eval_duration > 0 && metrics?.eval_count) info.push((metrics.eval_count * 1e9 / metrics.eval_duration).toFixed(1) + ' tok/s');
-  if (metrics?.prompt_eval_duration > 0) info.push((metrics.prompt_eval_duration / 1e9).toFixed(1) + ' s prompt');
-  box.textContent = info.join(' · ');
-}
 
-function money(value) {
-  if (!Number.isFinite(value) || value <= 0) return '$0';
-  const digits = value >= 0.01 ? 4 : 6;
-  return '$' + value.toFixed(digits).replace(/0+$/, '').replace(/\.$/, '');
-}
+  // Pinned Telemetry Strip (visible ONLY when >= 1 pinned item exists in current response)
+  const visiblePinned = items.filter((item) => telemetryPins.has(item.key));
+  const strip = byId('telemetry-strip');
+  const grid = byId('telemetry-pinned-grid');
+  const sourcesBox = byId('telemetry-pinned-sources');
+  grid.replaceChildren();
+  sourcesBox.replaceChildren();
 
-function updateCost(profile, response) {
-  const box = byId('ai-cost');
-  if (!profile || providerSpec(profile.provider).local) {
-    box.hidden = true;
-    box.textContent = '';
-    return;
+  const scalarPinned = visiblePinned.filter((item) => !item.sources?.length && !item.queries?.length);
+  const sourcesMetric = visiblePinned.find((item) => item.sources?.length || item.queries?.length);
+
+  if (!visiblePinned.length) {
+    strip.hidden = true;
+  } else {
+    strip.hidden = false;
+    grid.hidden = scalarPinned.length === 0;
+    for (const item of scalarPinned) {
+      const cell = document.createElement('div');
+      cell.className = 'telemetry-pinned-item';
+      const l = document.createElement('span');
+      l.className = 'telemetry-pinned-label';
+      l.textContent = item.shortLabel;
+      const v = document.createElement('span');
+      v.className = 'telemetry-pinned-val' + (item.tone ? ' ' + item.tone : '');
+      v.textContent = item.shortValue;
+      v.title = item.detail ? item.value + ' — ' + item.detail : item.value;
+      cell.append(l, v);
+      grid.append(cell);
+    }
+    if (sourcesMetric) {
+      sourcesBox.hidden = false;
+      sourcesBox.style.borderTop = scalarPinned.length ? '' : '0';
+      if (sourcesMetric.queries?.length) {
+        const qLine = document.createElement('div');
+        qLine.className = 'telemetry-pinned-queries';
+        qLine.textContent = 'Searched: ' + sourcesMetric.queries.map((q) => '“' + q + '”').join(' · ');
+        sourcesBox.append(qLine);
+      }
+      if (sourcesMetric.sources?.length) {
+        const pills = document.createElement('div');
+        pills.className = 'telemetry-source-pills';
+        for (const src of sourcesMetric.sources) {
+          const chip = document.createElement('a');
+          chip.className = 'source-link-chip';
+          chip.href = src.url;
+          chip.target = '_blank';
+          chip.rel = 'noopener noreferrer';
+          chip.title = src.title;
+          const label = document.createElement('span');
+          label.textContent = src.host || src.title;
+          chip.append(label, makeExternalIcon());
+          pills.append(chip);
+        }
+        sourcesBox.append(pills);
+      }
+    } else {
+      sourcesBox.hidden = true;
+    }
   }
-  const pricing = profile.pricing || { input: 0, output: 0 };
-  if (!pricing.input && !pricing.output) {
-    box.hidden = false;
-    box.textContent = 'Cost estimate unavailable — set token prices in Settings → LLM.';
-    return;
-  }
-  const usage = response?.usage;
-  const prompt = Number(usage?.prompt_tokens) || messageTokens(response?.context?.messages || []);
-  const completion = Number(usage?.completion_tokens) || YTCT.estimatedTokens(String(response?.content || ''));
-  const promptCost = prompt / 1e6 * pricing.input;
-  const answerCost = completion / 1e6 * pricing.output;
-  box.hidden = false;
-  box.textContent = 'Estimated cost for ' + profile.model + ' · prompt ≈ ' + money(promptCost)
-    + ' · answer ≈ ' + money(answerCost)
-    + ' · total ≈ ' + money(promptCost + answerCost)
-    + ' · ' + prompt.toLocaleString() + ' in / ' + completion.toLocaleString() + ' out tokens';
+
+  // Telemetry trigger button state
+  telemetryToggleBtn.hidden = mode !== 'ai';
+  telemetryToggleBtn.setAttribute('aria-expanded', String(telemetryDrawerOpen));
+  telemetryToggleBtn.classList.toggle('has-pins', visiblePinned.length > 0);
+  const pinCount = byId('telemetry-pin-count');
+  pinCount.hidden = visiblePinned.length === 0;
+  pinCount.textContent = String(visiblePinned.length);
+  telemetryDrawer.hidden = !telemetryDrawerOpen || mode !== 'ai';
+  byId('unpin-telemetry').disabled = telemetryPins.size === 0;
 }
 
-function beginCost(profile) {
-  const box = byId('ai-cost');
-  if (!profile || providerSpec(profile.provider).local) {
-    box.hidden = true;
-    box.textContent = '';
-    return;
-  }
-  const pricing = profile.pricing || { input: 0, output: 0 };
-  box.hidden = false;
-  box.textContent = pricing.input || pricing.output
-    ? 'Estimating request cost for ' + profile.model + '…'
-    : 'Cost estimate unavailable — set token prices in Settings → LLM.';
+function updateTelemetryFromResponse({ profile, response, contextWindow, resident = null, pricingEntry = null }) {
+  lastTelemetry = buildTelemetryReport({
+    profile,
+    response,
+    contextWindow,
+    resident,
+    pricingEntry,
+    allowWebSearch: profile?.allowWebSearch === true,
+  });
+  renderTelemetry();
 }
-
-function clearCost() {
-  const box = byId('ai-cost');
-  box.hidden = true;
-  box.textContent = '';
-}
-
 
 function confirmAction(text, label, signal) {
   byId('confirm-description').textContent = text;
@@ -1340,16 +1516,18 @@ function confirmAction(text, label, signal) {
   });
 }
 
-async function confirmSharing(profile, destination, includeTranscript, signal) {
-  const scope = JSON.stringify([destination, includeTranscript]);
-  if (approvedScopes.has(scope)) return true;
+async function confirmSharing(profile, includeTranscript, signal) {
+  const key = modelApprovalKey(profile);
+  if (approvedModels.has(key)) return true;
   const endpoint = endpointUrl(profile.endpoint);
   const text = 'Send to ' + canonicalEndpoint(profile.endpoint) + ' (' + profile.model + ')? Ask sends your question, earlier turns for this profile, and source details such as the YouTube link, commenter names, and comment text, including from loaded exports.'
     + (includeTranscript ? ' It may include video captions.' : '')
     + (profile.provider === 'ollama' ? ' It may include a thumbnail or post images.' : '')
-    + (isLoopback(endpoint) ? ' Your local server may forward requests to a cloud model.' : ' The provider handles the request under its own terms.');
-  if (!await confirmAction(text, 'Send for this visit', signal)) return false;
-  approvedScopes.add(scope);
+    + (isLoopback(endpoint) ? ' Your local server may forward requests to a cloud model.' : ' The provider handles the request under its own terms.')
+    + ' Once accepted, this prompt won’t appear again until you connect a different model.';
+  if (!await confirmAction(text, 'Accept & send', signal)) return false;
+  approvedModels.add(key);
+  worker('llm-approvals', { action: 'approve', key }).catch(() => {});
   return true;
 }
 
@@ -1433,7 +1611,7 @@ async function ask(question) {
     if (!await hasHostAccess(profile.endpoint)) throw new Error('Allow network access for this endpoint in Settings → LLM.');
     signal.throwIfAborted();
     const includeTranscript = options.shareTranscript && current.key.startsWith('video:');
-    if (!await confirmSharing(profile, destination, includeTranscript, signal)) return;
+    if (!await confirmSharing(profile, includeTranscript, signal)) return;
     signal.throwIfAborted();
     if (historyDestination !== destination || historyHasTranscript !== includeTranscript) {
       history = [];
@@ -1441,8 +1619,23 @@ async function ask(question) {
       historyDestination = destination;
       historyHasTranscript = includeTranscript;
     }
+    // On prompt send, ensure pricing/output-limit data is < 1 hour old (never background-polled).
+    const isLocalProvider = providerSpec(profile.provider).local;
+    let pricingEntry = null;
+    if (!isLocalProvider) {
+      try {
+        const res = await worker('pricing-lookup', {
+          provider: profile.provider,
+          model: profile.model,
+          force: false,
+          maxAgeMs: PRICING_TTL_MS,
+        });
+        pricingEntry = res?.entry || null;
+      } catch {}
+    }
+    signal.throwIfAborted();
     const contextWindow = effectiveContextWindow(profile, options.contextWindow);
-    beginCost(profile);
+    const maxOutputTokens = Math.max(Number(profile.maxOutputTokens) || 0, Number(pricingEntry?.maxOutputTokens) || 0);
     let acquired = { resident: null };
     if (profile.provider === 'ollama') {
       status('Checking Ollama…');
@@ -1450,12 +1643,10 @@ async function ask(question) {
       acquired = await worker('model-acquire', { profileId: profile.id, destination });
       signal.throwIfAborted();
       status(acquired.resident ? 'Waiting for Ollama…' : 'Loading ' + profile.model + '…');
-      updateTelemetry(null, contextWindow, acquired.resident, profile);
     } else {
       if (leaseRequested) await release();
       leaseRequested = false;
       status('Connecting to ' + (PROVIDERS[profile.provider]?.label || profile.provider) + '…');
-      updateTelemetry(null, contextWindow, null, profile);
     }
     const entry = current.entry;
     if (includeTranscript && !current.transcript && !current.transcriptTried) {
@@ -1478,7 +1669,7 @@ async function ask(question) {
     if (wantsImages) current.images = images;
     const session = {
       entry: { ...entry, transcript: includeTranscript ? current.transcript : null },
-      meta, key: current.key, contextWindow, commentRows: YTCT.commentRows(entry), images,
+      meta, key: current.key, contextWindow, maxOutputTokens, commentRows: YTCT.commentRows(entry), images,
     };
     await worker('mark-used', { key: current.key, pageId: current.pageId });
     signal.throwIfAborted();
@@ -1542,11 +1733,32 @@ async function ask(question) {
     if (response.context.trimmed) scope.push('Older chat turns omitted from the prompt');
     if (response.metrics?.done_reason === 'length') scope.push('Answer reached the output limit');
     if (scope.length) bubble('note', scope.join(' · '));
-    updateCost(profile, response);
-    updateTelemetry(response.metrics, contextWindow, acquired.resident, profile);
-    if (settings.debugOllama && profile.provider === 'ollama') {
+    // Synthesize estimated prompt/output counts only when provider omitted usage completely.
+    const enrichedResponse = {
+      ...response,
+      usage: response.usage || {
+        prompt_tokens: messageTokens(response.context?.messages || []),
+        completion_tokens: YTCT.estimatedTokens(String(response.content || '')),
+      },
+    };
+    updateTelemetryFromResponse({
+      profile,
+      response: enrichedResponse,
+      contextWindow,
+      resident: acquired.resident,
+      pricingEntry,
+    });
+    if (profile.provider === 'ollama') {
       const model = await loadedModel(profile.model).catch(() => acquired.resident);
-      if (isCurrent()) updateTelemetry(response.metrics, contextWindow, model, profile);
+      if (isCurrent()) {
+        updateTelemetryFromResponse({
+          profile,
+          response: enrichedResponse,
+          contextWindow,
+          resident: model,
+          pricingEntry: null,
+        });
+      }
     }
     status('Ready');
   } catch (error) {
@@ -1554,7 +1766,6 @@ async function ask(question) {
       if (!answerNode?.textContent) answerNode?.remove();
       bubble('error', error.message);
       status('Couldn’t complete the answer');
-      if (profile) clearCost();
       release();
     }
   } finally {
@@ -1720,7 +1931,6 @@ async function saveSettings(event) {
   try {
     settings = (await worker('settings', { values })).settings;
     viewer.setSettings(settings);
-    byId('telemetry').hidden = !settings.debugOllama;
     if (previous.semanticModel !== settings.semanticModel || previous.semanticDevice !== settings.semanticDevice || !settings.semanticSearchEnabled) {
       if (semanticIndexing) await cancelSemanticIndexing({ silent: true });
       semanticIndexedKey = '';
@@ -1763,6 +1973,8 @@ function setSettingsTab(name) {
     renderSavedPresets();
     refreshEmbeddingCacheInfo();
   }
+  const body = dialog.querySelector('.settings-body');
+  if (body) body.scrollTop = 0;
 }
 
 function profileOptionLabel(profile) {
@@ -1879,12 +2091,14 @@ function renderContextControls(provider, caps, preferredValue = null) {
   const ticks = byId('llm-context-ticks');
   const hint = byId('llm-context-hint');
   const maxCtx = caps?.contextLength || 0;
+  const maxOut = caps?.maxOutputTokens || 0;
   if (isCloudManagedProvider(provider)) {
     manualBox.hidden = true;
     autoBox.hidden = false;
-    autoBox.textContent = maxCtx
-      ? 'Context limit: automatic from model capabilities (' + formatContextLabel(maxCtx) + ' / ' + maxCtx.toLocaleString() + ' tokens).'
-      : 'Context limit: automatic from model capabilities.';
+    const parts = [];
+    if (maxCtx) parts.push('Context: ' + formatContextLabel(maxCtx));
+    if (maxOut) parts.push('Max output: ' + formatContextLabel(maxOut));
+    autoBox.textContent = parts.length ? parts.join(' · ') : 'Context: Auto';
     return;
   }
   autoBox.hidden = true;
@@ -1914,9 +2128,111 @@ function renderContextControls(provider, caps, preferredValue = null) {
     });
     return span;
   }));
-  hint.textContent = maxCtx
-    ? 'Model maximum: ' + formatContextLabel(maxCtx) + ' (' + maxCtx.toLocaleString() + ' tokens). Drag the slider or enter an exact token limit.'
-    : 'Drag the slider for power-of-two stops or enter an exact token limit.';
+  const parts = [];
+  if (maxCtx) parts.push('Context: ' + formatContextLabel(maxCtx));
+  if (maxOut) parts.push('Max output: ' + formatContextLabel(maxOut));
+  hint.textContent = parts.join(' · ');
+  hint.hidden = !hint.textContent;
+}
+
+function renderPricingUi(provider = byId('llm-provider').value || 'cloud', info = llmPricingInfo) {
+  const spec = providerSpec(provider);
+  const fieldset = byId('llm-pricing');
+  fieldset.hidden = spec.local;
+  if (spec.local) return;
+  const mode = byId('llm-pricing-mode').value === 'custom' ? 'custom' : 'auto';
+  byId('llm-pricing-auto').hidden = mode === 'custom';
+  byId('llm-pricing-custom').hidden = mode !== 'custom';
+
+  const badge = byId('llm-pricing-badge');
+  const summary = byId('llm-pricing-summary');
+  summary.replaceChildren();
+  const entry = info?.entry || null;
+  if (!entry) {
+    badge.textContent = info?.loading ? 'Syncing…' : (info?.error ? 'Unavailable' : 'No catalog entry');
+    return;
+  }
+  const sourceName = entry.source === 'openrouter' ? 'OpenRouter'
+    : entry.source === 'snapshot' ? 'Snapshot'
+      : 'LiteLLM';
+  badge.textContent = sourceName + ' · ' + formatRefreshAge(entry.fetchedAt || info?.fetchedAt);
+  for (const [label, val] of [
+    ['Input', formatRatePerMillion(entry.inputPerToken)],
+    ['Output', formatRatePerMillion(entry.outputPerToken)],
+    ['Cache hit', formatRatePerMillion(entry.cacheReadPerToken)],
+    ['Web search', formatRatePerThousand(entry.webSearchPerQuery)],
+  ]) {
+    if (!val) continue;
+    const row = document.createElement('div');
+    const k = document.createElement('span'); k.textContent = label;
+    const v = document.createElement('strong'); v.textContent = val;
+    row.append(k, v);
+    summary.append(row);
+  }
+  if (!summary.children.length) {
+    badge.textContent = sourceName + ' · no rates';
+  }
+}
+
+async function refreshPricingForForm({ force = false } = {}) {
+  const provider = byId('llm-provider').value || 'cloud';
+  const model = byId('llm-model').value.trim();
+  const spec = providerSpec(provider);
+  if (spec.local || !model) {
+    llmPricingInfo = null;
+    renderPricingUi(provider, null);
+    return null;
+  }
+  const seq = ++llmPricingSeq;
+  renderPricingUi(provider, { loading: true });
+  try {
+    const info = await worker('pricing-lookup', {
+      provider,
+      model,
+      force,
+      maxAgeMs: PRICING_TTL_MS,
+    });
+    if (seq !== llmPricingSeq || byId('llm-provider').value !== provider || byId('llm-model').value.trim() !== model) return null;
+    llmPricingInfo = info;
+    if (info?.entry) {
+      const mergedCaps = {
+        ...llmCurrentCaps,
+        contextLength: llmCurrentCaps?.contextLength || info.entry.maxInputTokens || 0,
+        maxOutputTokens: Math.max(Number(llmCurrentCaps?.maxOutputTokens) || 0, Number(info.entry.maxOutputTokens) || 0),
+      };
+      llmCurrentCaps = mergedCaps;
+      renderContextControls(provider, mergedCaps);
+    }
+    renderPricingUi(provider, info);
+    return info;
+  } catch (error) {
+    if (seq === llmPricingSeq) {
+      llmPricingInfo = { entry: null, error: error.message };
+      renderPricingUi(provider, llmPricingInfo);
+    }
+    return null;
+  }
+}
+
+function renderToolsUi(provider = byId('llm-provider').value || 'cloud') {
+  const spec = providerSpec(provider);
+  const section = byId('llm-tools-section');
+  const box = byId('llm-allow-web-search');
+  const hint = byId('llm-tools-hint');
+  section.hidden = spec.local;
+  if (spec.local) return;
+  box.disabled = !spec.webSearchCapable;
+  if (!spec.webSearchCapable) {
+    box.checked = false;
+    hint.textContent = 'Not supported by this provider.';
+    hint.hidden = false;
+  } else if (provider === 'perplexity') {
+    hint.textContent = 'Off sends disable_search: true.';
+    hint.hidden = false;
+  } else {
+    hint.textContent = '';
+    hint.hidden = true;
+  }
 }
 
 async function refreshModelCapabilities({ queryApi = true, preferredContext = null, preferredThinking = null, fallbackCaps = null } = {}) {
@@ -2051,7 +2367,8 @@ function updateLlmProviderUi() {
   endpoint.readOnly = provider === 'ollama';
   endpoint.placeholder = spec.defaultEndpoint || 'https://api.example.com/v1';
   byId('llm-model').placeholder = spec.defaultModel || 'model-id';
-  byId('llm-pricing').hidden = spec.local;
+  renderToolsUi(provider);
+  renderPricingUi(provider, llmPricingInfo);
   byId('llm-key').placeholder = spec.keyRequired ? 'API key' : 'Optional API key';
   if (provider === 'ollama') endpoint.value = spec.defaultEndpoint;
   byId('llm-provider-hint').textContent = spec.help || '';
@@ -2079,8 +2396,12 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-provider').value = provider;
   byId('llm-endpoint').value = draft.endpoint || spec.defaultEndpoint;
   byId('llm-model').value = draft.model || '';
+  byId('llm-allow-web-search').checked = !!draft.allowWebSearch;
+  byId('llm-pricing-mode').value = draft.pricingMode === 'custom' ? 'custom' : 'auto';
   byId('llm-input-price').value = draft.pricing?.input ?? 0;
   byId('llm-output-price').value = draft.pricing?.output ?? 0;
+  byId('llm-cache-read-price').value = draft.pricing?.cacheRead ?? 0;
+  byId('llm-web-search-price').value = draft.pricing?.webSearch ?? 0;
   byId('llm-assistant-name').value = draft.name || '';
   const derived = assistantLabel({ version: 1, activeProfileId: draft.id, profiles: [{ ...draft, name: '' }] });
   byId('llm-assistant-name').placeholder = derived || 'LLM';
@@ -2097,6 +2418,7 @@ function fillLlmForm(profile, isNew = false) {
   byId('llm-reveal').disabled = !saved;
   byId('llm-copy').disabled = !saved;
   byId('llm-clear-key').disabled = !saved;
+  llmPricingInfo = null;
   updateLlmProviderUi();
   if (saved) byId('llm-key').placeholder = 'Leave blank to keep ' + maskKey(draft.keyHint);
   refreshModelCapabilities({
@@ -2105,9 +2427,13 @@ function fillLlmForm(profile, isNew = false) {
     preferredThinking: draft.thinking || 'default',
     fallbackCaps: {
       contextLength: draft.maxContext || 0,
+      maxOutputTokens: draft.maxOutputTokens || 0,
       thinking: draft.thinkingCapabilities || null,
     },
   });
+  if (!spec.local && (draft.model || '').trim()) {
+    refreshPricingForForm({ force: false });
+  }
   const endpoint = byId('llm-endpoint').value;
   if (endpoint && (!isNew || spec.local)) {
     hasHostAccess(endpoint).then((allowed) => {
@@ -2161,8 +2487,12 @@ async function activateLlmProfileById(id) {
     applyAssistantName();
     fillLlmSelect();
     const profile = llm.profiles.find((row) => row.id === result.profileId);
-    if (profile) fillLlmForm(profile);
-    clearCost();
+    if (profile) {
+      fillLlmForm(profile);
+      // Connecting a newly activated model: force-refresh pricing regardless of stored age.
+      if (!providerSpec(profile.provider).local) refreshPricingForForm({ force: true });
+    }
+    clearTelemetry();
     setLlmStatus('Using ' + (profile?.label || 'saved profile') + '.');
     if (activeLlm()?.provider !== 'ollama' && leaseRequested && !job) release();
   } catch (error) {
@@ -2215,6 +2545,7 @@ function applyProviderChange() {
     });
   } else if (spec.defaultEndpoint && byId('llm-model').value.trim()) {
     refreshModelCapabilities({ queryApi: true });
+    refreshPricingForForm({ force: false });
   }
   llmDirty = true;
 }
@@ -2231,7 +2562,10 @@ function draftProfileForTest(values) {
     thinking: values.thinking,
     contextWindow: values.contextWindow,
     maxContext: values.maxContext,
+    maxOutputTokens: values.maxOutputTokens,
     thinkingCapabilities: values.thinkingCapabilities,
+    allowWebSearch: values.allowWebSearch,
+    pricingMode: values.pricingMode,
     pricing: values.pricing,
   };
 }
@@ -2296,6 +2630,7 @@ async function testConnection() {
       : 'Ollama is reachable and lists the selected model.');
     setLlmStatus('Connected to ' + providerSpec(values.provider).label + '.');
     await refreshModelCapabilities({ queryApi: true });
+    if (!providerSpec(values.provider).local) await refreshPricingForForm({ force: true });
   } catch (error) {
     setLlmStatus(error.message, true);
     if (/host access/i.test(error.message)) showGrant(providerOrigin({ endpoint: values.endpoint }));
@@ -2330,10 +2665,15 @@ function readLlmForm() {
     thinking: byId('llm-thinking').value || 'default',
     contextWindow,
     maxContext: llmCurrentCaps?.contextLength || 0,
+    maxOutputTokens: llmCurrentCaps?.maxOutputTokens || llmPricingInfo?.entry?.maxOutputTokens || 0,
     thinkingCapabilities: llmCurrentCaps?.thinking || undefined,
+    allowWebSearch: byId('llm-allow-web-search').checked === true,
+    pricingMode: byId('llm-pricing-mode').value === 'custom' ? 'custom' : 'auto',
     pricing: {
       input: Math.max(0, Number(byId('llm-input-price').value) || 0),
       output: Math.max(0, Number(byId('llm-output-price').value) || 0),
+      cacheRead: Math.max(0, Number(byId('llm-cache-read-price').value) || 0),
+      webSearch: Math.max(0, Number(byId('llm-web-search-price').value) || 0),
     },
     key: byId('llm-key').value,
     assistantName: byId('llm-assistant-name').value,
@@ -2353,8 +2693,22 @@ async function saveLlm() {
     setLlmStatus(error.message, true);
     return;
   }
+  const previousActive = activeLlm();
+  const isNewModelConnection = !previousActive
+    || previousActive.provider !== values.provider
+    || previousActive.model !== values.model;
   try {
     setLlmStatus('Saving…');
+    // Force pricing refresh when connecting a new model (also refreshes maxOutputTokens!).
+    if (!spec.local && isNewModelConnection) {
+      const fresh = await refreshPricingForForm({ force: true });
+      if (fresh?.entry?.maxOutputTokens) {
+        values.maxOutputTokens = Math.max(values.maxOutputTokens || 0, fresh.entry.maxOutputTokens);
+      }
+      if (fresh?.entry?.maxInputTokens && !values.maxContext) {
+        values.maxContext = fresh.entry.maxInputTokens;
+      }
+    }
     const result = await worker('llm-save-profile', {
       profile: {
         id: llmEditingId || undefined,
@@ -2365,7 +2719,10 @@ async function saveLlm() {
         thinking: values.thinking,
         contextWindow: values.contextWindow,
         maxContext: values.maxContext,
+        maxOutputTokens: values.maxOutputTokens,
         thinkingCapabilities: values.thinkingCapabilities,
+        allowWebSearch: values.allowWebSearch,
+        pricingMode: values.pricingMode,
         pricing: values.pricing,
       },
       key: values.key.trim() || undefined,
@@ -2382,7 +2739,7 @@ async function saveLlm() {
     fillLlmSelect();
     const profile = llm.profiles.find((row) => row.id === result.profileId);
     if (profile) fillLlmForm(profile);
-    clearCost();
+    clearTelemetry();
     if (activeLlm()?.provider !== 'ollama' && leaseRequested && !job) release();
     if (!profile) {
       setLlmStatus('Saved profile.');
@@ -2415,7 +2772,7 @@ async function deleteLlmProfile() {
     const active = result.profileId ? llm.profiles.find((row) => row.id === result.profileId) : null;
     if (active) fillLlmForm(active);
     else fillLlmForm(llmNewDraft, true);
-    clearCost();
+    clearTelemetry();
     setLlmStatus('Deleted the profile.');
     if (activeLlm()?.provider !== 'ollama' && leaseRequested && !job) release();
   } catch (error) {
@@ -2649,7 +3006,33 @@ byId('cancel-embed').addEventListener('click', () => cancelSemanticIndexing({ si
 byId('clear-indexed-comments').addEventListener('click', clearIndexedComments);
 byId('clear-downloaded-models').addEventListener('click', clearDownloadedModels);
 byId('collect').addEventListener('click', () => collect());
-byId('clear-chat').addEventListener('click', () => { approvedScopes.clear(); clearChat(); });
+byId('clear-chat').addEventListener('click', () => { clearChat(); });
+telemetryToggleBtn.addEventListener('click', () => {
+  telemetryDrawerOpen = !telemetryDrawerOpen;
+  renderTelemetry();
+});
+byId('close-telemetry').addEventListener('click', () => {
+  telemetryDrawerOpen = false;
+  renderTelemetry();
+});
+byId('unpin-telemetry').addEventListener('click', () => {
+  telemetryPins.clear();
+  renderTelemetry();
+  saveTelemetryPins();
+});
+byId('drawer-tools-badge').addEventListener('click', () => {
+  telemetryDrawerOpen = false;
+  renderTelemetry();
+  settingsTab = 'llm';
+  showSettings();
+});
+byId('llm-pricing-mode').addEventListener('change', () => {
+  renderPricingUi();
+  llmDirty = true;
+});
+byId('llm-pricing-refresh').addEventListener('click', () => {
+  refreshPricingForForm({ force: true });
+});
 byId('load-saved-export').addEventListener('click', loadSavedExport);
 byId('clear-cache').addEventListener('click', clearSavedExports);
 byId('collect-fresh').addEventListener('click', () => { closeSettings(); collect(true); });
@@ -2708,11 +3091,15 @@ byId('settings-llm').addEventListener('change', () => { llmDirty = true; });
 byId('llm-provider').addEventListener('change', applyProviderChange);
 byId('llm-model').addEventListener('input', () => {
   clearTimeout(llmModelDebounce);
-  llmModelDebounce = setTimeout(() => refreshModelCapabilities({ queryApi: true }), 250);
+  llmModelDebounce = setTimeout(() => {
+    refreshModelCapabilities({ queryApi: true });
+    refreshPricingForForm({ force: false });
+  }, 250);
 });
 byId('llm-model').addEventListener('change', () => {
   clearTimeout(llmModelDebounce);
   refreshModelCapabilities({ queryApi: true });
+  refreshPricingForForm({ force: true });
 });
 byId('llm-context-slider').addEventListener('input', () => {
   const step = llmCurrentSteps[Number(byId('llm-context-slider').value)];
@@ -2860,6 +3247,16 @@ chrome.storage.onChanged.addListener((changes, area) => {
     savedPresets = changes.searchPresets.newValue;
     renderSavedPresets();
   }
+  if (changes.telemetryPins?.newValue) {
+    telemetryPins = new Set(Array.isArray(changes.telemetryPins.newValue) ? changes.telemetryPins.newValue : []);
+    renderTelemetry();
+  }
+  if (changes.approvedLlmDestinations?.newValue) {
+    approvedModels.clear();
+    if (Array.isArray(changes.approvedLlmDestinations.newValue)) {
+      for (const k of changes.approvedLlmDestinations.newValue) approvedModels.add(k);
+    }
+  }
   if (changes.llmConfig?.newValue) loadLlmConfig();
 });
 chrome.tabs.onUpdated.addListener((id, change) => { if (id === tabId && change.status === 'complete') connect(); });
@@ -2888,6 +3285,8 @@ if (tabId > 0) {
     updateSearchUi();
   }).catch((error) => notice(error.message));
   loadSearchPresets();
+  loadTelemetryPins();
+  loadApprovedModels();
   loadLlmConfig();
 } else {
   const [active] = await chrome.tabs.query({ active: true, currentWindow: true });

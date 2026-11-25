@@ -61,7 +61,17 @@ function streamRemote(payload, signal, onUpdate) {
         thinking = !!message.thinking;
         usage = message.usage || usage;
         finish = message.finish || '';
-        settle({ content, thinking, usage, finish });
+        settle({
+          content,
+          thinking,
+          usage,
+          rawUsage: message.rawUsage || null,
+          rawTimings: message.rawTimings || null,
+          model: message.model || '',
+          serviceTier: message.serviceTier || '',
+          toolsInfo: message.toolsInfo || null,
+          finish,
+        });
       } else if (message?.type === 'error') {
         settleError(new Error(message.error || 'The model request failed.'));
       }
@@ -89,7 +99,14 @@ export async function askRemote(session, history, question, settings, profile, o
     let visible = false;
     let result;
     try {
-      result = await streamRemote({ profileId: profile.id, destination: profileDestination(profile), messages, thinking }, signal, (update) => {
+      result = await streamRemote({
+        profileId: profile.id,
+        destination: profileDestination(profile),
+        messages,
+        thinking,
+        maxOutputTokens: Number(session.maxOutputTokens) || Number(profile.maxOutputTokens) || 0,
+        contextWindow: Number(session.contextWindow) || 0,
+      }, signal, (update) => {
         if (String(update.content || '').trim()) visible = true;
         onChange({ content: update.content, thinking: update.thinking, usage: update.usage, links: context.links });
       });
@@ -105,6 +122,11 @@ export async function askRemote(session, history, question, settings, profile, o
         content: result.content,
         thinking: result.thinking,
         usage: result.usage,
+        rawUsage: result.rawUsage,
+        rawTimings: result.rawTimings,
+        model: result.model,
+        serviceTier: result.serviceTier,
+        toolsInfo: result.toolsInfo,
         finish: result.finish,
         metrics: {
           done_reason: result.finish,
